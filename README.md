@@ -1,48 +1,51 @@
 # NEXUS
 
-NEXUS is a native Rust desktop application for discovering, evaluating, and orchestrating AI agents, model providers, and tools available on a user's computer.
+NEXUS is a native Rust desktop application for AI-agent orchestration. Phase 0 establishes a minimal `egui`/`eframe` window, structured logging, typed startup/configuration errors, and TOML configuration defaults. Agent discovery, provider integrations, model routing, and mission execution are not implemented.
 
-**Current status:** planning / repository bootstrap. The implementation must proceed in small, testable phases.
+## Requirements
 
-## Initial goals
+- Stable Rust toolchain with Cargo and the `aarch64-apple-darwin` target on Apple Silicon macOS.
+- macOS system SDK and linker tools (normally provided by Xcode Command Line Tools).
 
-- Discover supported AI agent harnesses, model providers, CLIs, MCP servers, and ACP agents.
-- Keep agent harnesses, providers, and individual models as separate concepts.
-- Recommend and coordinate agents/models for a task using compatibility, task-specific quality evidence, cost, latency, availability, and observed outcomes.
-- Provide a native Mission Control interface for task status and resource monitoring.
-- Respect user permissions, provider terms, and documented integration interfaces.
+The CI workflow runs on macOS and checks formatting, Clippy, and unit tests.
 
-## Non-goals for the initial prototype
+## Build and run
 
-- No local LLM runtime.
-- No Docker, Python backend, Node backend, Electron, Tauri, or web frontend.
-- No reverse engineering private APIs or bypassing provider quotas.
-- No automatic credential extraction.
-- No claim of live progress or cloud resource usage unless an integration actually reports it.
+From the repository root:
 
-## Initial platform
+```sh
+cargo run
+```
 
-- macOS on Apple Silicon.
-- Rust workspace.
-- Native GUI: `egui` / `eframe`.
-- Async runtime: Tokio.
-- Persistence: SQLite.
-- System monitoring: `sysinfo`, with native macOS measurements added only where justified.
+Create an optimized executable:
 
-## Getting started
+```sh
+cargo build --release
+```
 
-Read `AGENTS.md` and the documents in `docs/` before implementing anything.
+The executable is `target/release/nexus-app`. This phase does not create a signed or notarized `.app` bundle; packaging requires a later distribution decision.
 
-The first task is `docs/CODEX_FIRST_TASK.md`. Implement Phase 0 only; do not jump ahead to agent integrations.
+## Checks
 
-## Resource objective
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo build --release
+```
 
-NEXUS's own process should remain below 1 GB RAM. Initial engineering targets:
+## Configuration and logs
 
-- Idle target: below 250 MB.
-- Typical mission target: below 500 MB.
-- Heavy workload target: below 750 MB.
-- Warning threshold: 700 MB.
-- Critical internal threshold: 900 MB.
+Configuration is loaded from `~/Library/Application Support/NEXUS/config.toml` on macOS. If that file is absent, built-in defaults are used. A minimal override is:
 
-Measure actual release-build memory. Do not treat these targets as already achieved. Track NEXUS separately from child agent processes.
+```toml
+welcome_message = "Your local agent workspace is ready to configure."
+```
+
+Set `RUST_LOG` to control structured log filtering (for example, `RUST_LOG=debug cargo run`). Phase 0 does not scan the machine, access credentials, start background services, or make network requests at runtime.
+
+Tokio is deferred until a bounded asynchronous operation is introduced; this phase has no async I/O or background tasks.
+
+## Resource use
+
+No NEXUS memory measurement has been made. The targets in [docs/RESOURCE_BUDGET.md](docs/RESOURCE_BUDGET.md) remain targets, not claims about this prototype.
