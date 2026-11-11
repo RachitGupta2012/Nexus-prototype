@@ -28,6 +28,12 @@
 - Update documentation when architecture, permissions, resource use, or supported integrations change.
 - Do not commit or push unless the user explicitly asks.
 
-## First task
+## Detection Is Not Permission
 
-Follow `docs/CODEX_FIRST_TASK.md` exactly. Implement Phase 0 only.
+- Detecting an installed agent does not grant permission to execute, control, authenticate with, or interact with it.
+- Discovery must remain strictly read-only.
+- Never execute an agent or its commands during discovery.
+- Never access credentials, authentication sessions, private configuration, or agent data as part of discovery.
+- Any operation beyond passive discovery requires explicit, informed user approval.
+- Permission for one operation does not imply permission for another.
+- Never interpret an agent’s presence, availability, or authentication status as user consent.
