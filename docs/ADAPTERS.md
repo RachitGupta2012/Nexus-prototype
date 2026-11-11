@@ -79,3 +79,23 @@ OmniRush and any other proprietary or less-documented tool must remain unintegra
 ## Model selection truthfulness
 
 If an external harness exposes model selection, NEXUS may use it. If it does not, NEXUS may recommend a model but must not claim to have switched it. Never reverse-engineer private APIs or bypass service restrictions.
+
+## Phase 3 capability evidence and routing
+
+`capability.rs` provides typed capability identifiers and a small curated catalog separate from discovery records. The initial claims are vendor-documented software-development workflows for the nine existing harness candidates. They do not claim individual file operations, research, data analysis, document processing, writing, structured output, or tool-use support. Capability is never inferred from executable presence.
+
+Evidence states are Verified, Documented, User-reported, Inferred, Unsupported, and Unknown. The source, evidence state/method, optional version, review date, concise claim, and limitation are retained. The current catalog contains documentation claims only. Routing may treat recent documented claims as tentative, but only exact version-matched Verified claims can produce Supported. A missing version is explicitly version-unverified; evidence older than 365 days, undated, future-dated, for another version, or in conflict cannot establish eligibility. The date cutoff is a simple deterministic freshness rule, not a claim that vendor behavior changes on a schedule.
+
+Routing accepts a typed task, immutable discovered-record snapshot, catalog, and explicit timestamp. It ranks deterministically without arbitrary scores, preserves semantic ties, and reports unknown requirements rather than treating them as passing. Manual selection is session-only and changes no evidence or registry state. This feature does not execute agents or authorize execution.
+
+## Supported macOS application bundles
+
+Each explicit agent rescan also checks the exact bundle paths `DeepAI Code.app` and `OpenCode.app` directly under `/Applications` and `~/Applications`. This check is nonrecursive, bounded to two roots and two names, and reads filesystem metadata only. It does not inspect `Info.plist`, application contents, configuration, credentials, or running processes. The current list is curated and non-exhaustive. A found application is displayed separately from a detected CLI and is not claimed controllable or usable by NEXUS.
+
+## Explicit API provider connector
+
+The initial provider client supports OpenAI-compatible Chat Completions endpoints, including compatible gateways such as FreeLLMAPI. Configure a base URL and model identifier (a gateway may document a selector such as `auto`). NEXUS sends `{model, messages, stream:false}` and reads the first text choice. This protocol is not universal: native Anthropic Messages, Gemini `generateContent`, and other distinct provider APIs are not supported by this connector. Provider adapters should be added only against official documented APIs, with protocol-specific authentication, limits, error handling, and tests; do not claim universal market coverage.
+
+The user enters a provider-issued API key and explicitly saves or removes it. On macOS it is stored in Keychain under the configured endpoint origin, so changing hosts does not reuse the old host's key. The value is read only when the user explicitly submits a task. Remote endpoints require HTTPS; loopback HTTP is allowed for local gateways. The request does not follow redirects, has a 120-second total timeout, and reads at most 2 MiB of response data. Task content is not logged or persisted by this connector. No key is searched for or imported.
+
+This is a model response connection, not an agent harness. It does not read a workspace, write files, run commands, or execute a discovered CLI. It does not claim the provider selected a particular upstream model beyond the configured identifier. Agent execution and workspace operations require separately designed adapters and explicit authorization.

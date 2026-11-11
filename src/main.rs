@@ -1,8 +1,13 @@
 mod agent;
+mod application;
+mod capability;
 mod config;
 mod discovery;
 mod error;
+mod provider;
 mod registry;
+mod routing;
+mod task;
 #[cfg(feature = "telemetry")]
 mod telemetry;
 mod ui;

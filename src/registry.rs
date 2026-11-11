@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentId, AgentRecord, Knowledge};
+use crate::application::ApplicationDetection;
 use crate::discovery::{DiscoveryScope, LocationResult, LocationStatus, ScanReport};
 
 const REGISTRY_FILE_NAME: &str = "registry.toml";
@@ -38,6 +39,8 @@ pub enum RegistryError {
 pub struct AgentRegistry {
     schema_version: u32,
     pub records: Vec<AgentRecord>,
+    #[serde(default)]
+    pub applications: Vec<ApplicationDetection>,
     #[serde(default)]
     pub last_scan_unix_secs: Option<u64>,
     #[serde(default)]
@@ -109,6 +112,7 @@ impl AgentRegistry {
             })
             .collect();
         self.schema_version = REGISTRY_SCHEMA_VERSION;
+        self.applications = report.applications;
         self.last_scan_unix_secs = Some(report.completed_at_unix_secs);
         self.last_search_roots = report
             .locations
@@ -460,6 +464,7 @@ mod tests {
 
         registry.merge_scan(ScanReport {
             records: vec![crate::agent::AgentRecord::catalog_entry(AgentId::CodexCli)],
+            applications: vec![],
             locations: vec![LocationResult {
                 path: PathBuf::from("/opt/homebrew/bin"),
                 status: LocationStatus::Checked,

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentId, AgentRecord, DetectionStatus, ExecutableLocation};
+use crate::application::{ApplicationDetection, detect_applications, macos_application_roots};
 
 const MAX_PATH_ENTRIES: usize = 64;
 const MAX_PATH_BYTES: usize = 16 * 1024;
@@ -72,6 +73,7 @@ pub struct ScanProgress {
 #[derive(Clone, Debug)]
 pub struct ScanReport {
     pub records: Vec<AgentRecord>,
+    pub applications: Vec<ApplicationDetection>,
     pub locations: Vec<LocationResult>,
     pub completed_at_unix_secs: u64,
     pub scope: DiscoveryScope,
@@ -482,9 +484,35 @@ fn scan(
     progress: &Mutex<ScanProgress>,
 ) -> ScanOutcome {
     let mut locations = plan.initial_results.clone();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let application_roots = macos_application_roots(home.as_deref());
+    let applications = detect_applications(&application_roots, unix_time_now());
+    for root in &application_roots {
+        match fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.file_type().is_symlink() => locations.push(LocationResult {
+                path: root.clone(), status: LocationStatus::Skipped,
+                reason: "application search root is a symlink".into(),
+            }),
+            Ok(metadata) if metadata.is_dir() => locations.push(LocationResult {
+                path: root.clone(), status: LocationStatus::Checked,
+                reason: "exact supported .app bundle names checked directly; no recursion or bundle contents read".into(),
+            }),
+            Ok(_) => locations.push(LocationResult {
+                path: root.clone(), status: LocationStatus::Skipped,
+                reason: "application search root is not a directory".into(),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => locations.push(LocationResult {
+                path: root.clone(), status: LocationStatus::Missing,
+                reason: "application search root does not exist".into(),
+            }),
+            Err(_) => locations.push(LocationResult {
+                path: root.clone(), status: LocationStatus::Inaccessible,
+                reason: "application search root cannot be inspected".into(),
+            }),
+        }
+    }
     let mut roots = plan.roots.clone();
     if scope == DiscoveryScope::Expanded {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
         for root in expanded_search_roots(home.as_deref()) {
             if !roots
                 .iter()
@@ -738,6 +766,7 @@ fn scan(
     let _ = EXPANDED_SCOPE_VERSION;
     ScanOutcome::Complete(ScanReport {
         records,
+        applications,
         locations: bounded_diagnostics(locations),
         completed_at_unix_secs: unix_time_now(),
         scope,

@@ -41,3 +41,23 @@
 - Respect provider terms, quotas, and rate limits.
 - Show estimated cost only when pricing and usage data are available; label estimates.
 - Never bypass authentication, usage limits, or access controls.
+
+## Explicit provider requests
+
+- Phase 3's local recommendation engine remains pure and offline. A separate provider request is made only after the user presses **Send task to provider**.
+- The initial connector supports OpenAI-compatible Chat Completions only. It does not imply support for every API provider or distinct API protocol.
+- The user supplies the API key. NEXUS does not search for keys, import environment variables, inspect provider configuration, or query Keychain until an explicit send. Saving and removing a key are separate user actions; macOS keys are stored in Keychain under the configured endpoint origin, never in the NEXUS config or logs. Changing to a different host does not reuse the previous host's key.
+- Remote provider requests send the task text and model identifier to the configured endpoint and may incur charges. The UI explains this before the send action. A user-configured remote endpoint must use HTTPS; plain HTTP is accepted only for loopback addresses. Embedded credentials, query strings, fragments, and redirects are rejected/disabled.
+- Requests run on one short-lived standard-library worker thread with a 120-second total timeout and bounded response body. No polling, background service, telemetry, or automatic requests are added.
+- The connector returns text only. It does not execute agents, edit project files, or grant execution authorization. A future agent/workspace operation requires separate explicit authorization for that specific task, agent, workspace, and operations.
+
+## Phase 3 recommendation-only boundary
+
+- Routing reads only the current NEXUS registry snapshot and the in-code curated capability catalog. It is synchronous and pure; it cannot access files, processes, network, credentials, Keychain, agent configuration, or external commands.
+- Task descriptions, category choices, requirements, recommendation results, and manual overrides are held only in UI memory for the current session. They are not written to the registry or logs.
+- A recommendation is not permission. Every routing screen states that the selected candidate has not been authorized to run. Manual override affects only the session selection.
+- Phase 3 adds no execution, authentication, or adapter path. Future execution must receive separate informed authorization for the specific agent, task, workspace, and permitted operations.
+
+## macOS application discovery
+
+An explicit discovery scan checks only the exact `DeepAI Code.app` and `OpenCode.app` bundle paths under `/Applications` and `~/Applications`. The check is nonrecursive and uses metadata only; it does not open bundles, read their manifests or contents, or launch applications. Application presence is reported separately from CLI detection and grants no control or execution permission.

@@ -9,12 +9,16 @@ use crate::error::AppError;
 #[serde(default)]
 pub struct Config {
     pub welcome_message: String,
+    pub provider_base_url: String,
+    pub provider_model: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             welcome_message: "Your local agent workspace is ready to configure.".to_owned(),
+            provider_base_url: "http://127.0.0.1:3001/v1".to_owned(),
+            provider_model: "auto".to_owned(),
         }
     }
 }
@@ -63,6 +67,7 @@ mod tests {
         let config: Config = toml::from_str("welcome_message = 'Hello, NEXUS'").unwrap();
 
         assert_eq!(config.welcome_message, "Hello, NEXUS");
+        assert_eq!(config.provider_model, "auto");
     }
 
     #[test]
@@ -83,6 +88,7 @@ mod tests {
         ));
         let config = Config {
             welcome_message: "Hello from a saved config".to_owned(),
+            ..Config::default()
         };
 
         config.save(&path).unwrap();

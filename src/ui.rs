@@ -1,17 +1,22 @@
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
 #[cfg(feature = "telemetry")]
 use std::time::Duration;
 
 use eframe::egui;
 
 use crate::agent::{AgentId, AgentRecord, IntegrationStatus, Knowledge};
+use crate::capability::CapabilityId;
 use crate::config::Config;
 use crate::discovery::{
     DiscoveryController, DiscoveryScope, EXPANDED_SCOPE_VERSION, ScanOutcome, ScanState,
     standard_search_plan, validate_custom_location,
 };
 use crate::error::AppError;
+use crate::provider::{self, ProviderSettings};
 use crate::registry::AgentRegistry;
+use crate::routing::{self, CandidateResult, Outcome, RecommendationSet};
+use crate::task::{MAX_DESCRIPTION_BYTES, Task, TaskCategory, TaskId};
 
 pub fn run(config: Config, config_path: PathBuf, registry_path: PathBuf) -> Result<(), AppError> {
     let options = eframe::NativeOptions {
@@ -43,6 +48,7 @@ struct NexusApp {
     registry_status: Option<String>,
     discovery: DiscoveryController,
     agent_ui: AgentUiState,
+    provider_ui: ProviderUiState,
     #[cfg(feature = "telemetry")]
     telemetry: crate::telemetry::TelemetryService,
 }
@@ -53,6 +59,8 @@ enum Section {
     Agents,
     Missions,
     Resources,
+    Routing,
+    Providers,
 }
 
 #[derive(Default)]
@@ -61,6 +69,29 @@ struct AgentUiState {
     custom_location_message: Option<String>,
     version_editor: Option<AgentId>,
     version_value: String,
+    routing: RoutingUiState,
+}
+
+#[derive(Default)]
+struct RoutingUiState {
+    description: String,
+    category: Option<TaskCategory>,
+    mandatory: Vec<CapabilityId>,
+    preferences: Vec<CapabilityId>,
+    result: Option<RecommendationSet>,
+    selected: Option<AgentId>,
+    validation: Option<String>,
+    next_task_id: u64,
+}
+
+#[derive(Default)]
+struct ProviderUiState {
+    api_key_draft: String,
+    key_saved: Option<bool>,
+    status: Option<String>,
+    response: Option<String>,
+    busy: bool,
+    receiver: Option<Receiver<Result<String, String>>>,
 }
 
 impl NexusApp {
@@ -85,6 +116,7 @@ impl NexusApp {
             registry_status,
             discovery: DiscoveryController::default(),
             agent_ui: AgentUiState::default(),
+            provider_ui: ProviderUiState::default(),
             #[cfg(feature = "telemetry")]
             telemetry: crate::telemetry::TelemetryService::start(),
         }
@@ -93,6 +125,31 @@ impl NexusApp {
 
 impl eframe::App for NexusApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some(receiver) = &self.provider_ui.receiver {
+            match receiver.try_recv() {
+                Ok(Ok(response)) => {
+                    self.provider_ui.response = Some(response);
+                    self.provider_ui.status = Some("Provider response received.".to_owned());
+                    self.provider_ui.busy = false;
+                    self.provider_ui.receiver = None;
+                }
+                Ok(Err(message)) => {
+                    self.provider_ui.status = Some(message);
+                    self.provider_ui.busy = false;
+                    self.provider_ui.receiver = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.provider_ui.status =
+                        Some("Provider request ended unexpectedly.".to_owned());
+                    self.provider_ui.busy = false;
+                    self.provider_ui.receiver = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
+        }
         if let Some(outcome) = self.discovery.poll() {
             match outcome {
                 ScanOutcome::Complete(report) => {
@@ -123,6 +180,8 @@ impl eframe::App for NexusApp {
 
                 ui.selectable_value(&mut self.selected_section, Section::Overview, "Overview");
                 ui.selectable_value(&mut self.selected_section, Section::Agents, "Agents");
+                ui.selectable_value(&mut self.selected_section, Section::Routing, "Routing");
+                ui.selectable_value(&mut self.selected_section, Section::Providers, "Providers");
                 ui.selectable_value(&mut self.selected_section, Section::Missions, "Missions");
                 ui.selectable_value(&mut self.selected_section, Section::Resources, "Resources");
 
@@ -171,6 +230,19 @@ impl eframe::App for NexusApp {
                                 &mut self.agent_ui,
                             );
                         }
+                        Section::Routing => show_routing(
+                            ui,
+                            &self.registry,
+                            &self.config,
+                            &mut self.agent_ui.routing,
+                            &mut self.provider_ui,
+                        ),
+                        Section::Providers => show_provider_settings(
+                            ui,
+                            &mut self.config,
+                            &self.config_path,
+                            &mut self.provider_ui,
+                        ),
                         Section::Missions => {
                             ui.heading("Missions");
                             ui.label("Mission orchestration is planned for a later phase.");
@@ -188,6 +260,407 @@ impl eframe::App for NexusApp {
     }
 }
 
+fn show_routing(
+    ui: &mut egui::Ui,
+    registry: &AgentRegistry,
+    config: &Config,
+    state: &mut RoutingUiState,
+    provider_ui: &mut ProviderUiState,
+) {
+    ui.heading("Task Routing");
+    ui.label("Local recommendation from detected-agent records and curated capability evidence.");
+    ui.colored_label(
+        ui.visuals().warn_fg_color,
+        "Recommendation only — this agent has not been authorized to run.",
+    );
+    let mut changed = false;
+    ui.label("Task description (kept in memory for this UI session only)");
+    let response = ui.add(
+        egui::TextEdit::multiline(&mut state.description)
+            .desired_rows(4)
+            .char_limit(MAX_DESCRIPTION_BYTES),
+    );
+    changed |= response.changed();
+    ui.small(format!(
+        "{} / {} bytes",
+        state.description.len(),
+        MAX_DESCRIPTION_BYTES
+    ));
+
+    egui::ComboBox::from_label("Task category (select or confirm)")
+        .selected_text(
+            state
+                .category
+                .map_or("Select a category", TaskCategory::label),
+        )
+        .show_ui(ui, |ui| {
+            for category in TaskCategory::ALL {
+                let response =
+                    ui.selectable_value(&mut state.category, Some(category), category.label());
+                changed |= response.changed();
+            }
+        });
+
+    ui.add_space(8.0);
+    ui.label("Requirements and preferences");
+    ui.small("Unknown capabilities do not satisfy mandatory requirements. Each capability can be required or preferred.");
+    ui.collapsing("Evidence labels", |ui| {
+        for state in crate::capability::EvidenceState::ALL {
+            ui.label(match state {
+                crate::capability::EvidenceState::Verified => format!(
+                    "{} — approved evidence matched to the installed version.",
+                    state.label()
+                ),
+                crate::capability::EvidenceState::Documented => format!(
+                    "{} — vendor documentation; not locally verified.",
+                    state.label()
+                ),
+                crate::capability::EvidenceState::UserReported => format!(
+                    "{} — supplied by the user, not independently verified.",
+                    state.label()
+                ),
+                crate::capability::EvidenceState::Inferred => format!(
+                    "{} — never sufficient on its own for routing.",
+                    state.label()
+                ),
+                crate::capability::EvidenceState::Unsupported => format!(
+                    "{} — current evidence says the capability is unavailable.",
+                    state.label()
+                ),
+                crate::capability::EvidenceState::Unknown => format!(
+                    "{} — evidence is missing, stale, or conflicting.",
+                    state.label()
+                ),
+            });
+        }
+    });
+    egui::Grid::new("routing_capabilities")
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("Capability");
+            ui.strong("Mandatory");
+            ui.strong("Optional");
+            ui.end_row();
+            for capability in CapabilityId::ALL {
+                ui.label(capability.label());
+                let mut required = state.mandatory.contains(&capability);
+                if ui.checkbox(&mut required, "Required").changed() {
+                    if required {
+                        state.mandatory.push(capability);
+                        state.preferences.retain(|item| *item != capability);
+                    } else {
+                        state.mandatory.retain(|item| *item != capability);
+                    }
+                    changed = true;
+                }
+                let mut preferred = state.preferences.contains(&capability);
+                if ui.checkbox(&mut preferred, "Preferred").changed() {
+                    if preferred {
+                        state.preferences.push(capability);
+                        state.mandatory.retain(|item| *item != capability);
+                    } else {
+                        state.preferences.retain(|item| *item != capability);
+                    }
+                    changed = true;
+                }
+                ui.end_row();
+            }
+        });
+
+    if changed {
+        state.result = None;
+        state.selected = None;
+        state.validation = None;
+    }
+    if let Some(message) = &state.validation {
+        ui.colored_label(ui.visuals().warn_fg_color, message);
+    }
+    let can_recommend = !state.description.trim().is_empty()
+        && state.category.is_some()
+        && state.mandatory.len() + state.preferences.len() <= crate::task::MAX_REQUIREMENTS;
+    if ui
+        .add_enabled(can_recommend, egui::Button::new("Recommend agents"))
+        .clicked()
+    {
+        let category = state
+            .category
+            .expect("enabled only when a category is selected");
+        let task = Task::new(
+            TaskId(state.next_task_id),
+            state.description.clone(),
+            category,
+            state.mandatory.clone(),
+            state.preferences.clone(),
+        );
+        match task {
+            Ok(task) => {
+                state.next_task_id = state.next_task_id.saturating_add(1);
+                state.result = Some(routing::recommend(
+                    &task,
+                    &registry.records,
+                    crate::capability::CATALOG,
+                    crate::discovery::unix_time_now(),
+                ));
+                state.selected = state
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.primary.first().copied());
+                state.validation = None;
+            }
+            Err(error) => state.validation = Some(format!("Task is not valid: {error}")),
+        }
+    }
+    if state.category.is_none() {
+        ui.small("Choose a category before requesting a recommendation.");
+    }
+    if state.mandatory.len() + state.preferences.len() > crate::task::MAX_REQUIREMENTS {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "Choose at most 12 total requirements and preferences.",
+        );
+    }
+
+    if let Some(result) = &state.result {
+        ui.separator();
+        if result.primary.is_empty() {
+            ui.heading("No evidence-sufficient recommendation");
+            ui.label("The current registry and capability evidence do not support a recommendation. Review the gaps below.");
+        } else {
+            ui.heading(if result.primary.len() > 1 {
+                "Tied recommendations"
+            } else {
+                "Recommendation"
+            });
+            if result.primary.len() > 1 {
+                ui.label(format!(
+                    "These candidates tie under the evidence-based comparison: {}",
+                    result
+                        .primary
+                        .iter()
+                        .map(|id| id.display_name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        show_recommendation_results(ui, result, &mut state.selected);
+    }
+
+    ui.separator();
+    ui.heading("Ask a provider");
+    ui.label("This sends the task text to the configured API endpoint. Remote providers receive the text and may charge for usage. Nothing is sent until you press the button.");
+    let can_send = !state.description.trim().is_empty() && !provider_ui.busy;
+    if ui
+        .add_enabled(can_send, egui::Button::new("Send task to provider"))
+        .clicked()
+    {
+        let settings = ProviderSettings {
+            base_url: config.provider_base_url.clone(),
+            model: config.provider_model.clone(),
+        };
+        let prompt = state.description.clone();
+        let (sender, receiver) = mpsc::channel();
+        provider_ui.busy = true;
+        provider_ui.response = None;
+        provider_ui.status = Some("Sending task to the configured endpoint…".to_owned());
+        provider_ui.receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let result = provider::with_saved_api_key(&settings, |key| {
+                provider::complete(&settings, key, &prompt)
+            })
+            .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+    }
+    if provider_ui.busy {
+        ui.spinner();
+    }
+    if let Some(status) = &provider_ui.status {
+        ui.label(status);
+    }
+    if let Some(response) = &provider_ui.response {
+        ui.group(|ui| {
+            ui.heading("Provider response");
+            ui.label(response);
+        });
+    }
+}
+
+fn show_provider_settings(
+    ui: &mut egui::Ui,
+    config: &mut Config,
+    config_path: &std::path::Path,
+    state: &mut ProviderUiState,
+) {
+    ui.heading("Provider connection");
+    ui.label("Connect to one OpenAI-compatible chat API endpoint, including compatible gateways such as FreeLLMAPI. NEXUS does not detect or import existing API keys.");
+    ui.label("Provider base URL");
+    if ui
+        .text_edit_singleline(&mut config.provider_base_url)
+        .changed()
+    {
+        state.key_saved = None;
+    }
+    ui.label("Model or gateway selector");
+    ui.text_edit_singleline(&mut config.provider_model);
+    ui.small("For a FreeLLMAPI gateway, use its local base URL (for example http://127.0.0.1:3001/v1) and model `auto`. Remote endpoints must use HTTPS; plain HTTP is limited to localhost.");
+    let settings = ProviderSettings {
+        base_url: config.provider_base_url.clone(),
+        model: config.provider_model.clone(),
+    };
+    if ui.button("Save provider settings").clicked() {
+        state.status = Some(match settings.validate() {
+            Ok(_) => match config.save(config_path) {
+                Ok(()) => "Provider settings saved. No API key is stored in this file.".to_owned(),
+                Err(error) => format!("Could not save provider settings: {error}"),
+            },
+            Err(error) => format!("Provider settings are invalid: {error}"),
+        });
+    }
+    ui.separator();
+    ui.heading("API key");
+    ui.label("Enter a key you obtained directly from your provider. NEXUS stores it in the macOS Keychain, not in configuration or logs.");
+    ui.add(
+        egui::TextEdit::singleline(&mut state.api_key_draft)
+            .password(true)
+            .char_limit(16_384)
+            .hint_text("Paste API key"),
+    );
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                !state.api_key_draft.trim().is_empty(),
+                egui::Button::new("Save key to Keychain"),
+            )
+            .clicked()
+        {
+            state.status = Some(
+                match provider::store_api_key(&settings, &state.api_key_draft) {
+                    Ok(()) => {
+                        state.api_key_draft.clear();
+                        state.key_saved = Some(true);
+                        "API key saved to macOS Keychain.".to_owned()
+                    }
+                    Err(error) => format!("Could not save API key: {error}"),
+                },
+            );
+        }
+        if ui.button("Remove saved key").clicked() {
+            state.status = Some(match provider::remove_api_key(&settings) {
+                Ok(()) => {
+                    state.key_saved = Some(false);
+                    "Saved API key removed from macOS Keychain.".to_owned()
+                }
+                Err(error) => format!("Could not remove API key: {error}"),
+            });
+        }
+    });
+    ui.label(match state.key_saved {
+        Some(true) => "A key was saved during this session. Its value is never displayed.",
+        Some(false) => "No key is saved (removed during this session).",
+        None => "Key status has not been checked this session; NEXUS does not read Keychain until you explicitly send a task.",
+    });
+    if let Some(status) = &state.status {
+        ui.label(status);
+    }
+    ui.separator();
+    ui.label("Protocol coverage: OpenAI-compatible Chat Completions only. Providers with a different API protocol are not supported by this connector yet. A provider response is text only; it does not edit project files or run an agent.");
+}
+
+fn show_recommendation_results(
+    ui: &mut egui::Ui,
+    set: &RecommendationSet,
+    selected: &mut Option<AgentId>,
+) {
+    for candidate in &set.candidates {
+        ui.group(|ui| show_candidate_result(ui, candidate, selected));
+        ui.add_space(6.0);
+    }
+}
+
+fn show_candidate_result(
+    ui: &mut egui::Ui,
+    candidate: &CandidateResult,
+    selected: &mut Option<AgentId>,
+) {
+    ui.horizontal(|ui| {
+        ui.heading(&candidate.display_name);
+        ui.strong(candidate.outcome.label());
+        ui.label(format!("Discovery: {}", candidate.discovery_status.label()));
+    });
+    if candidate.tied_for_primary {
+        ui.label("Tied primary recommendation");
+    }
+    for explanation in &candidate.explanation {
+        ui.label(format!("• {explanation}"));
+    }
+    if !candidate.requirements.is_empty() {
+        ui.label("Mandatory requirements:");
+        for requirement in &candidate.requirements {
+            ui.label(format!(
+                "• {} — {:?}{}{}",
+                requirement.capability.label(),
+                requirement.state,
+                requirement
+                    .freshness
+                    .map(|freshness| format!(" · {freshness:?}"))
+                    .unwrap_or_default(),
+                requirement
+                    .evidence_summary
+                    .map(|summary| format!(" · {summary}"))
+                    .unwrap_or_default()
+            ));
+            show_evidence_provenance(ui, requirement);
+        }
+    }
+    if let Some(category) = &candidate.category_evidence {
+        ui.label(format!(
+            "Category evidence: {:?}{}{}",
+            category.state,
+            category
+                .freshness
+                .map(|freshness| format!(" · {freshness:?}"))
+                .unwrap_or_default(),
+            category
+                .evidence_summary
+                .map(|summary| format!(" · {summary}"))
+                .unwrap_or_default()
+        ));
+        show_evidence_provenance(ui, category);
+    }
+    for limitation in &candidate.limitations {
+        ui.small(format!("Limitation: {limitation}"));
+    }
+    if candidate.outcome != Outcome::Excluded
+        && ui
+            .button(if *selected == Some(candidate.agent) {
+                "Selected for this session"
+            } else {
+                "Manually select for this session"
+            })
+            .clicked()
+    {
+        *selected = Some(candidate.agent);
+    }
+    if *selected == Some(candidate.agent) {
+        ui.colored_label(ui.visuals().warn_fg_color, "Session selection only. This does not change evidence, discovery, permissions, or execution authorization.");
+    }
+}
+
+fn show_evidence_provenance(ui: &mut egui::Ui, evidence: &crate::routing::RequirementResult) {
+    if let Some(method) = evidence.evidence_method {
+        let source = evidence.evidence_source.unwrap_or("source not recorded");
+        let version = evidence.evidence_version.unwrap_or("not version-specific");
+        let reviewed = evidence
+            .reviewed_at_unix_secs
+            .map(format_age)
+            .unwrap_or_else(|| "date not recorded".to_owned());
+        ui.small(format!(
+            "Evidence: {method} · source: {source} · version: {version} · reviewed: {reviewed}"
+        ));
+    }
+}
+
 fn show_agent_registry(
     ui: &mut egui::Ui,
     discovery: &mut DiscoveryController,
@@ -201,6 +674,7 @@ fn show_agent_registry(
         version_value,
         expanded_consent_open,
         custom_location_message,
+        ..
     } = agent_ui;
     if matches!(
         discovery.state(),
@@ -212,6 +686,27 @@ fn show_agent_registry(
 
     ui.heading("Agent Registry");
     ui.label("Detection is passive. NEXUS does not execute agents, verify versions, inspect credentials, or establish usability.");
+    ui.collapsing("Supported macOS applications", |ui| {
+        ui.label("NEXUS checks exact supported .app bundle names directly in /Applications and ~/Applications. It does not recurse into these folders or read bundle contents.");
+        if registry.applications.is_empty() {
+            ui.small("No application bundle scan has been recorded yet; run Rescan candidates.");
+        }
+        for application in &registry.applications {
+            ui.horizontal(|ui| {
+                ui.label(&application.display_name);
+                ui.strong(match application.status {
+                    crate::application::ApplicationStatus::Found => "Found",
+                    crate::application::ApplicationStatus::NotFoundInCheckedApplications => "Not found in checked Applications folders",
+                    crate::application::ApplicationStatus::Inaccessible => "Inaccessible",
+                    crate::application::ApplicationStatus::SkippedSymlink => "Skipped symlink",
+                });
+            });
+            if let Some(path) = &application.path {
+                ui.small(format!("Application bundle: {}", path.display()));
+            }
+            ui.small("Presence does not establish that NEXUS can control or use this application.");
+        }
+    });
     ui.horizontal(|ui| {
         ui.label("Discovery scope:");
         if ui
@@ -810,4 +1305,84 @@ fn format_duration(duration: Duration) -> String {
     let minutes = (seconds % 3_600) / 60;
     let seconds = seconds % 60;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+#[cfg(test)]
+mod routing_ui_tests {
+    use super::*;
+    use crate::routing::CandidateResult;
+
+    #[test]
+    fn routing_screen_renders_empty_and_each_recommendation_outcome() {
+        let context = egui::Context::default();
+        let registry = AgentRegistry::empty();
+        let mut state = RoutingUiState::default();
+        let mut provider_ui = ProviderUiState::default();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            show_routing(
+                ui,
+                &registry,
+                &Config::default(),
+                &mut state,
+                &mut provider_ui,
+            )
+        });
+        output.textures_delta.clear();
+
+        for outcome in [
+            Outcome::Supported,
+            Outcome::Tentative,
+            Outcome::InsufficientEvidence,
+            Outcome::Rejected,
+            Outcome::Excluded,
+        ] {
+            let candidate = CandidateResult {
+                agent: AgentId::CodexCli,
+                display_name: AgentId::CodexCli.display_name().to_owned(),
+                discovery_status: crate::agent::DetectionStatus::Found,
+                outcome,
+                requirements: vec![],
+                category_evidence: None,
+                matched_preferences: vec![],
+                unknown_preferences: vec![],
+                explanation: vec!["Test explanation".into()],
+                limitations: vec![],
+                tied_for_primary: false,
+            };
+            let recommended = matches!(outcome, Outcome::Supported | Outcome::Tentative);
+            state.result = Some(RecommendationSet {
+                candidates: vec![candidate],
+                primary: if recommended {
+                    vec![AgentId::CodexCli]
+                } else {
+                    vec![]
+                },
+                has_sufficient_recommendation: recommended,
+            });
+            let mut provider_ui = ProviderUiState::default();
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                show_routing(
+                    ui,
+                    &registry,
+                    &Config::default(),
+                    &mut state,
+                    &mut provider_ui,
+                )
+            });
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn provider_settings_screen_renders_without_reading_keychain() {
+        let context = egui::Context::default();
+        let mut config = Config::default();
+        let mut state = ProviderUiState::default();
+        let path = std::env::temp_dir().join("nexus-provider-settings-test.toml");
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            show_provider_settings(ui, &mut config, &path, &mut state)
+        });
+        output.textures_delta.clear();
+        assert_eq!(state.key_saved, None);
+    }
 }

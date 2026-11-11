@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 const VENDOR_DOCS_REVIEWED_AT_UNIX_SECS: u64 = 1_794_401_854;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentId {
     CodexCli,

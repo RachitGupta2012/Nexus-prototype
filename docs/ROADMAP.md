@@ -35,14 +35,15 @@
 
 **Exit criteria:** registry claims distinguish observations, vendor documentation, user-reported information, and unknown values; detected candidates are not represented as integrated or usable; no agent is executed or contacted.
 
-## Phase 3 — model intelligence
+## Phase 3 — intelligent agent routing
 
-- Canonical model identities and provider-specific variants.
-- Import provider model catalogs where documented.
-- Add benchmark adapters only after verifying current APIs, terms, pricing, and rate limits.
-- Store source, timestamp, confidence, and task category for every score.
-- Combine external evidence with NEXUS's own observed outcomes.
-- Never use one universal leaderboard for every task category.
+- Represent bounded, session-only tasks with user-confirmed categories, mandatory requirements, and optional preferences.
+- Maintain a typed, curated capability catalog with provenance and freshness evidence, separate from executable discovery.
+- Recommend only from detected, unambiguous, non-ignored candidates using a deterministic local comparison.
+- Explain supported, tentative, insufficient-evidence, rejected, and excluded outcomes; preserve ties and allow a session-only manual override.
+- Keep execution authorization false; do not execute agents or persist task descriptions.
+
+**Exit criteria:** recommendations are reproducible and explainable; unknown mandatory requirements never pass; no agent execution, authentication, network access, or registry schema change is introduced.
 
 ## Phase 4 — agent integrations
 
@@ -53,7 +54,13 @@
 - Support timeouts, cancellation, output limits, and capability negotiation.
 - Never claim automatic model switching if an external harness does not expose it.
 
-## Phase 5 — mission engine and routing
+### Provider connector foundation (implemented incrementally)
+
+- The current app includes a user-configured OpenAI-compatible Chat Completions connection and macOS Keychain storage for a manually supplied API key.
+- This supports compatible endpoints/gateways such as FreeLLMAPI; native protocols for other vendors remain future work and must use official documentation.
+- Provider responses are text only. This foundation does not execute an agent, inspect a workspace, or edit files.
+
+## Phase 5 — mission engine
 
 - Task schema: objective, constraints, workspace, budget, privacy, deliverables.
 - Manual Master Agent selection and automatic selection.
