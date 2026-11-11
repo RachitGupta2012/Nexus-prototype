@@ -31,3 +31,11 @@ The NEXUS application process must remain below 1 GB RAM.
 - Add regression tests or repeatable profiling scenarios as the application grows.
 
 Rust alone does not guarantee low memory use. Measure real builds and workloads.
+
+## Phase 1 telemetry
+
+The Resource Monitor samples only the NEXUS process. RSS is reported in decimal MB to match the thresholds above; it is not interchangeable with macOS physical footprint. CPU is process CPU percentage relative to one logical core and may exceed 100% when multiple cores are used. Uptime and peak observed RSS are session-local.
+
+Sampling runs every two seconds and retains at most 300 samples (ten minutes) in memory. No resource history is written to disk or transmitted. If a sample fails, the last successful value remains visible as stale and the app continues running. The telemetry worker is stopped and joined when the application exits.
+
+For an enabled/disabled comparison, build the default release app with telemetry enabled and sample its own PID using `ps -p PID -o pid,rss,%cpu,etime,command`. Then build and run with `cargo build --release --no-default-features`; this build retains the Resource Monitor section with collection disabled. Use the same Mac, display setup, idle period, and sampling window for both. Record RSS and CPU as reported by `ps`, and do not label RSS as physical footprint. The earlier 87.5 MiB reading remains a single Phase 0 snapshot, not a sustained baseline.

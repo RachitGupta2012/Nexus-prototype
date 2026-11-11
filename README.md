@@ -1,6 +1,6 @@
 # NEXUS
 
-NEXUS is a native Rust desktop application for AI-agent orchestration. Phase 0 establishes a minimal `egui`/`eframe` window, structured logging, typed startup/configuration errors, and TOML configuration defaults. Agent discovery, provider integrations, model routing, and mission execution are not implemented.
+NEXUS is a native Rust desktop application for AI-agent orchestration. Phase 0 established the `egui`/`eframe` foundation; Phase 1 adds an in-process Resource Monitor for NEXUS's own RSS, CPU, PID, uptime, and bounded recent history. Agent discovery, provider integrations, model routing, mission execution, and child-agent monitoring are not implemented.
 
 ## Requirements
 
@@ -25,6 +25,12 @@ cargo build --release
 
 The executable is `target/release/nexus-app`. This phase does not create a signed or notarized `.app` bundle; packaging requires a later distribution decision.
 
+Build without telemetry for a repeatable enabled/disabled resource comparison:
+
+```sh
+cargo build --release --no-default-features
+```
+
 ## Checks
 
 ```sh
@@ -44,8 +50,8 @@ welcome_message = "Your local agent workspace is ready to configure."
 
 Set `RUST_LOG` to control structured log filtering (for example, `RUST_LOG=debug cargo run`). Phase 0 does not scan the machine, access credentials, start background services, or make network requests at runtime.
 
-Tokio is deferred until a bounded asynchronous operation is introduced; this phase has no async I/O or background tasks.
+Tokio is deferred until a bounded asynchronous operation is introduced; this phase uses one bounded, stoppable standard-library thread for local process sampling.
 
 ## Resource use
 
-No NEXUS memory measurement has been made. The targets in [docs/RESOURCE_BUDGET.md](docs/RESOURCE_BUDGET.md) remain targets, not claims about this prototype.
+The Resource Monitor reports NEXUS RSS, not macOS physical footprint, and keeps ten minutes of samples in memory. The targets in [docs/RESOURCE_BUDGET.md](docs/RESOURCE_BUDGET.md) remain targets, not guarantees.

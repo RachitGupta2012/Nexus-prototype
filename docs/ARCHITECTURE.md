@@ -49,3 +49,7 @@ Initially run as one desktop application process. Use Tokio for bounded asynchro
 ## Evidence and status
 
 Every externally sourced benchmark or capability claim should record source, retrieval time, and confidence/freshness. If an agent does not expose progress, display the last verified event rather than inventing activity.
+
+## Phase 1 process telemetry
+
+The initial Resource Monitor samples only NEXUS's own PID through a process-specific provider. It keeps a bounded ten-minute in-memory history and does not inspect unrelated processes. Future child-agent metrics must remain a separate stream and must never be included in NEXUS's own process totals.

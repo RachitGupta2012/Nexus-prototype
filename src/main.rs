@@ -1,5 +1,7 @@
 mod config;
 mod error;
+#[cfg(feature = "telemetry")]
+mod telemetry;
 mod ui;
 
 use std::path::PathBuf;
@@ -10,7 +12,11 @@ use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), AppError> {
     init_logging();
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "Starting NEXUS");
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        pid = std::process::id(),
+        "Starting NEXUS"
+    );
 
     let config_path = config_path()?;
     let config = Config::load_or_default(&config_path)?;
