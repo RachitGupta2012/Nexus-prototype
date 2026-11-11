@@ -53,3 +53,13 @@ Every externally sourced benchmark or capability claim should record source, ret
 ## Phase 1 process telemetry
 
 The initial Resource Monitor samples only NEXUS's own PID through a process-specific provider. It keeps a bounded ten-minute in-memory history and does not inspect unrelated processes. Future child-agent metrics must remain a separate stream and must never be included in NEXUS's own process totals.
+
+## Phase 2 discovery and registry
+
+Discovery is an explicit user action. Standard Discovery uses a short-lived standard-library worker to check exact candidate names in at most 64 eligible PATH roots (16 KiB input), conventional macOS package-manager/user binary roots, and optional user-approved direct custom directories. The full roots and skip reasons are displayed. Expanded Discovery requires explicit scope consent and walks only `/Applications`, `/opt`, and the current user's `~/Applications` to depth 4, at most 128 directories/3,000 entries, or 10 seconds. It skips symlinked directories and protected/personal-data subtrees. Both modes are cancelable; cancellation is checked between filesystem operations. Custom folders use a native macOS folder picker and are rejected when path components are symlinks or the filesystem is remote/unrecognized. Safe platform filesystem metadata comes through the small `nix` wrapper; folder picking uses macOS AppKit through `rfd`. No shell, package manager, candidate, process list, credentials, configuration, or network is accessed.
+
+`DiscoveryScope` remains separate from `IntegrationStatus`. Scope consent authorizes only passive local detection. The approval version is persisted so any material catalog/scope change can require renewed consent. Custom paths are stored only in NEXUS's registry and authorize exact nonrecursive checks directly in the selected directory. Registry search-result details are bounded and disclose when the presentation limit is reached.
+
+The registry stores NEXUS-owned metadata in `registry.toml` beside the application configuration. Writes use a same-directory temporary file, restrictive permissions, sync, and atomic rename after validating the destination and rejecting symlink components. A scan updates only this NEXUS-owned file. It does not alter agent files. The initial registry contains candidates and evidence only; provider/model catalogs and adapters remain separate future work.
+
+Candidate detection, version, running state, authentication, connectability, and usability remain distinct. Vendor documentation is recorded as documentation evidence, not proof about the detected installation. Version verification is a separate user-run operation; NEXUS does not execute version commands during discovery. No adapter is implemented in Phase 2.

@@ -22,6 +22,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sysinfo = { version = "0.40.1", default-features = false, features = ["system"], optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+rfd = { version = "0.18", default-features = false }
+
 [lints.rust]
 unsafe_code = "forbid"
 

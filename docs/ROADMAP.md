@@ -21,11 +21,19 @@
 
 ## Phase 2 — discovery and registry
 
-- Bounded PATH and known application discovery.
-- Supported package-manager and process inventory where safe.
-- Read only documented configuration metadata; redact secret-like values.
-- Let the user add, ignore, and rescan integrations.
+- Maintain a documented bounded catalog of verified agent harness/CLI identities, including Codex CLI, Claude Code, OpenCode, Pi, Gemini CLI, GitHub Copilot CLI, Aider, Amp, and Goose.
+- Standard Discovery checks exact executable names in eligible PATH roots plus documented Homebrew/npm/Cargo/Bun/Volta/pnpm and other common user-level binary locations only on explicit request.
+- Offer a separate, explicitly approved Expanded scope over named local software-install roots, with traversal/time/entry limits, exclusions, progress, and cancellation.
+- Allow optional user-authorized custom local folders for direct exact-name checks only; reject unsafe paths and remote/unrecognized filesystems.
+- Provide location evidence and skip reasons in a scrollable registry UI, and keep sidebar navigation fixed.
+- Keep a NEXUS-owned registry with evidence, last-scan metadata, custom locations, and scope approval version.
+- Let the user ignore/restore candidates and rescan.
+- Keep version verification separate and user-run; never execute candidate or version commands during discovery.
+- Do not invoke package managers, shells, or candidates, or inspect process lists, agent configuration, credentials, Keychain, authentication sessions, file contents, or unrelated personal data.
+- Detection is not permission: no presence result enables execution, authentication, or control.
 - Represent installed, running, authenticated, connectable, and usable as distinct states.
+
+**Exit criteria:** registry claims distinguish observations, vendor documentation, user-reported information, and unknown values; detected candidates are not represented as integrated or usable; no agent is executed or contacted.
 
 ## Phase 3 — model intelligence
 

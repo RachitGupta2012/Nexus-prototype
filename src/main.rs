@@ -1,5 +1,8 @@
+mod agent;
 mod config;
+mod discovery;
 mod error;
+mod registry;
 #[cfg(feature = "telemetry")]
 mod telemetry;
 mod ui;
@@ -20,7 +23,8 @@ fn main() -> Result<(), AppError> {
 
     let config_path = config_path()?;
     let config = Config::load_or_default(&config_path)?;
-    ui::run(config, config_path)?;
+    let registry_path = config_path.with_file_name("registry.toml");
+    ui::run(config, config_path, registry_path)?;
     Ok(())
 }
 
