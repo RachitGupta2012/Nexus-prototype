@@ -4,12 +4,19 @@ use eframe::egui;
 
 use crate::config::Config;
 use crate::error::AppError;
-use crate::storage::Storage;
+use crate::storage::{DEFAULT_MAX_CONVERSATIONS, Storage};
 
 mod chat;
 mod providers;
+mod settings;
+mod usage;
 
-pub fn run(config: Config, config_path: PathBuf, storage: Storage) -> Result<(), AppError> {
+pub fn run(
+    config: Config,
+    config_path: PathBuf,
+    database_path: PathBuf,
+    storage: Storage,
+) -> Result<(), AppError> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("NEXUS")
@@ -22,7 +29,12 @@ pub fn run(config: Config, config_path: PathBuf, storage: Storage) -> Result<(),
         "NEXUS",
         options,
         Box::new(move |_creation_context| {
-            Ok(Box::new(NexusApp::new(config, config_path, storage)))
+            Ok(Box::new(NexusApp::new(
+                config,
+                config_path,
+                database_path,
+                storage,
+            )))
         }),
     )?;
 
@@ -32,11 +44,15 @@ pub fn run(config: Config, config_path: PathBuf, storage: Storage) -> Result<(),
 struct NexusApp {
     config: Config,
     config_path: PathBuf,
+    database_path: PathBuf,
     storage: Storage,
     selected_section: Section,
     status: Option<String>,
     chat: chat::ChatScreen,
     providers: providers::ProvidersScreen,
+    settings: settings::SettingsScreen,
+    usage: usage::UsageScreen,
+    last_title: String,
     #[cfg(feature = "telemetry")]
     telemetry: crate::telemetry::TelemetryService,
 }
@@ -52,25 +68,55 @@ enum Section {
 }
 
 impl NexusApp {
-    fn new(config: Config, config_path: PathBuf, storage: Storage) -> Self {
+    fn new(config: Config, config_path: PathBuf, database_path: PathBuf, storage: Storage) -> Self {
+        storage.set_history_writes(config.history_enabled);
+        storage.set_tool_output_writes(config.save_tool_outputs);
+        let _ = storage.prune(config.history_retention_days, DEFAULT_MAX_CONVERSATIONS);
         let chat = chat::ChatScreen::new(&config, &storage);
         let providers = providers::ProvidersScreen::new(&config);
         Self {
             config,
             config_path,
+            database_path,
             storage,
             selected_section: Section::Chat,
             status: None,
             chat,
             providers,
+            settings: settings::SettingsScreen::new(),
+            usage: usage::UsageScreen::new(),
+            last_title: "NEXUS".to_owned(),
             #[cfg(feature = "telemetry")]
             telemetry: crate::telemetry::TelemetryService::start(),
+        }
+    }
+
+    fn save_config(&mut self) {
+        self.status = Some(match self.config.save(&self.config_path) {
+            Ok(()) => "Configuration saved.".to_owned(),
+            Err(error) => format!("Could not save configuration: {error}"),
+        });
+    }
+
+    fn update_window_title(&mut self, ctx: &egui::Context) {
+        let title = self
+            .chat
+            .window_title()
+            .unwrap_or_else(|| "NEXUS".to_owned());
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
         }
     }
 }
 
 impl eframe::App for NexusApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        settings::apply_config_theme(ui.ctx(), &self.config);
+        self.storage.set_history_writes(self.config.history_enabled);
+        self.storage
+            .set_tool_output_writes(self.config.save_tool_outputs);
+
         egui::Panel::left("navigation")
             .resizable(false)
             .default_size(210.0)
@@ -93,101 +139,88 @@ impl eframe::App for NexusApp {
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.separator();
                     ui.small("Local desktop application");
+                    if let Some(status) = &self.status {
+                        ui.small(status);
+                    }
                 });
             });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            if self.selected_section == Section::Chat {
-                self.chat.show(ui, &self.config, &self.storage);
-                return;
-            }
-            if self.selected_section == Section::Providers {
-                self.providers.show(ui, &mut self.config, &self.config_path);
-                return;
-            }
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.add_space(12.0);
-                    match self.selected_section {
-                        Section::Chat => {}
-                        Section::Providers => {}
-                        Section::Mcp => {
-                            ui.heading("MCP");
-                            ui.label("MCP client connections will appear here. No server is started automatically.");
-                        }
-                        Section::Usage => {
-                            ui.heading("Usage");
-                            show_usage(ui, &self.storage);
-                        }
-                        Section::Resources => {
-                            #[cfg(feature = "telemetry")]
-                            show_resources(ui, &self.telemetry);
-                            #[cfg(not(feature = "telemetry"))]
-                            {
-                                ui.heading("Resources");
-                                ui.label("Telemetry is disabled in this build.");
-                            }
-                        }
-                        Section::Settings => {
-                            ui.heading("Settings");
-                            ui.label("History retention, appearance, and local data controls.");
-                            ui.small(format!("Configuration: {}", self.config_path.display()));
-                            if ui.button("Save configuration").clicked() {
-                                self.status = Some(match self.config.save(&self.config_path) {
-                                    Ok(()) => "Configuration saved.".to_owned(),
-                                    Err(error) => format!("Could not save configuration: {error}"),
-                                });
-                            }
-                            if let Some(status) = &self.status {
-                                ui.label(status);
-                            }
-                        }
+        match self.selected_section {
+            Section::Chat => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let outcome = self.chat.show(ui, &mut self.config, &self.storage);
+                    if outcome.open_providers {
+                        self.selected_section = Section::Providers;
+                    }
+                    if outcome.dismiss_callout {
+                        self.config.first_run_callout_dismissed = true;
+                        self.save_config();
                     }
                 });
-        });
+            }
+            Section::Providers => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.providers.show(ui, &mut self.config, &self.config_path);
+                });
+            }
+            Section::Usage => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let outcome = self.usage.show(ui, &self.config, &self.storage);
+                    if outcome.open_settings {
+                        self.selected_section = Section::Settings;
+                    }
+                });
+            }
+            Section::Settings => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let outcome = self.settings.show(
+                        ui,
+                        &mut self.config,
+                        &self.storage,
+                        &self.config_path,
+                        &self.database_path,
+                    );
+                    if outcome.history_cleared {
+                        self.chat.on_history_cleared();
+                    }
+                });
+            }
+            Section::Mcp | Section::Resources => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add_space(12.0);
+                            match self.selected_section {
+                                Section::Mcp => show_mcp_placeholder(ui),
+                                Section::Resources => {
+                                    #[cfg(feature = "telemetry")]
+                                    show_resources(ui, &self.telemetry);
+                                    #[cfg(not(feature = "telemetry"))]
+                                    {
+                                        ui.heading("Resources");
+                                        ui.label("Telemetry is disabled in this build.");
+                                    }
+                                }
+                                _ => {}
+                            }
+                        });
+                });
+            }
+        }
+        self.update_window_title(ui.ctx());
     }
 }
 
-fn show_usage(ui: &mut egui::Ui, storage: &Storage) {
-    match storage.usage_rows() {
-        Ok(rows) if rows.is_empty() => {
-            ui.label("No provider usage has been recorded yet.");
-        }
-        Ok(rows) => {
-            egui::Grid::new("usage_rows")
-                .striped(true)
-                .num_columns(6)
-                .show(ui, |ui| {
-                    ui.strong("Provider");
-                    ui.strong("Model");
-                    ui.strong("Messages");
-                    ui.strong("Input tokens");
-                    ui.strong("Output tokens");
-                    ui.strong("Estimated cost");
-                    ui.end_row();
-                    for row in rows {
-                        ui.label(row.provider_id.to_string());
-                        ui.label(&row.model);
-                        ui.label(row.message_count.to_string());
-                        ui.label(row.input_tokens.to_string());
-                        ui.label(row.output_tokens.to_string());
-                        ui.label(match row.currency {
-                            Some(currency) if row.estimated_cost > 0.0 => {
-                                format!("~${:.4} {currency}", row.estimated_cost)
-                            }
-                            _ => "—".to_owned(),
-                        });
-                        ui.end_row();
-                    }
-                });
-        }
-        Err(error) => {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                format!("Could not read usage: {error}"),
-            );
-        }
+fn show_mcp_placeholder(ui: &mut egui::Ui) {
+    ui.heading("MCP");
+    ui.label("MCP client connections will appear here. No server is started automatically.");
+    if ui
+        .small_button("Learn about the planned MCP boundary")
+        .clicked()
+    {
+        ui.ctx()
+            .open_url(egui::OpenUrl::new_tab("https://modelcontextprotocol.io"));
     }
 }
 

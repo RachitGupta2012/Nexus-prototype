@@ -124,7 +124,7 @@ impl ProvidersScreen {
             ui.allocate_ui_with_layout(
                 egui::vec2(LIST_WIDTH, height),
                 Layout::top_down(Align::LEFT),
-                |ui| self.list(ui, config, config_path),
+                |ui| self.list(ui, config),
             );
             ui.separator();
             ui.allocate_ui_with_layout(
@@ -151,7 +151,7 @@ impl ProvidersScreen {
         }
     }
 
-    fn list(&mut self, ui: &mut egui::Ui, config: &mut Config, config_path: &Path) {
+    fn list(&mut self, ui: &mut egui::Ui, config: &mut Config) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.heading("Providers");
@@ -221,17 +221,11 @@ impl ProvidersScreen {
         }
 
         ui.separator();
-        if ui.button("Save configuration").clicked() {
-            self.status = Some(match config.save(config_path) {
-                Ok(()) => "Configuration saved.".to_owned(),
-                Err(error) => format!("Could not save the configuration: {error}"),
-            });
-        }
         if let Some(status) = &self.status {
             ui.small(status);
         }
         ui.add_space(6.0);
-        ui.small("Secrets live in the macOS Keychain. Only endpoints and model prices are written to disk.");
+        ui.small("Secrets live in the macOS Keychain. Only endpoints and model prices are written to disk. Settings saves this same file.");
     }
 
     fn editor(&mut self, ui: &mut egui::Ui, config: &mut Config, config_path: &Path) {
@@ -279,6 +273,7 @@ impl ProvidersScreen {
             ));
             ui.add_space(8.0);
 
+            let tools_supported = provider.protocol.supports_tools();
             let previous_protocol = provider.protocol;
             let mut chosen_protocol = previous_protocol;
             egui::Grid::new("provider_fields")
@@ -410,6 +405,20 @@ impl ProvidersScreen {
                             );
                         }
 
+                        let mut supports_tools = model.supports_tools.unwrap_or(false);
+                        if ui
+                            .add_enabled(
+                                tools_supported,
+                                egui::Checkbox::new(&mut supports_tools, "tools"),
+                            )
+                            .on_disabled_hover_text(
+                                "This provider protocol has no tool-call support in this build.",
+                            )
+                            .changed()
+                        {
+                            model.supports_tools = Some(supports_tools);
+                        }
+
                         let mut has_pricing = model.pricing.is_some();
                         if ui.checkbox(&mut has_pricing, "pricing").changed() {
                             model.pricing = has_pricing.then(default_pricing);
@@ -463,7 +472,7 @@ impl ProvidersScreen {
             }
 
             ui.add_space(10.0);
-            if ui.button("Save configuration").clicked() {
+            if ui.button("Save provider configuration").clicked() {
                 self.status = Some(match config.save(config_path) {
                     Ok(()) => "Configuration saved.".to_owned(),
                     Err(error) => format!("Could not save the configuration: {error}"),
@@ -635,6 +644,25 @@ fn default_pricing() -> ModelPricing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn providers_renders_with_the_default_profile() {
+        let mut config = Config::default();
+        let mut screen = ProvidersScreen::new(&config);
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1_080.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let path = std::path::Path::new("/tmp/nexus-config.toml");
+        let mut output = ctx.run_ui(input, |ui| {
+            screen.show(ui, &mut config, path);
+        });
+        output.textures_delta.clear();
+    }
 
     #[test]
     fn presets_are_consistent_and_keep_their_model_in_the_catalog() {

@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -41,6 +43,8 @@ pub enum StorageError {
     InvalidData(String),
     #[error("local database schema version {found} is newer than this build supports")]
     UnsupportedSchema { found: i64 },
+    #[error("history is disabled; conversation content was not written")]
+    HistoryDisabled,
 }
 
 pub fn unix_time_now() -> u64 {
@@ -52,6 +56,34 @@ pub fn unix_time_now() -> u64 {
 
 pub struct Storage {
     connection: Connection,
+    history_writes: AtomicBool,
+    tool_output_writes: AtomicBool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub currency: Option<String>,
+    pub estimated_cost: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageTotals {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    /// Estimated cost grouped by currency; never mixed into one number.
+    pub costs: Vec<(String, f64)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageDay {
+    pub day_start_utc: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub costs: Vec<(String, f64)>,
 }
 
 pub struct NewMessage<'a> {
@@ -115,9 +147,35 @@ impl Storage {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
-        let mut storage = Self { connection };
+        let mut storage = Self {
+            connection,
+            history_writes: AtomicBool::new(true),
+            tool_output_writes: AtomicBool::new(true),
+        };
         storage.migrate()?;
         Ok(storage)
+    }
+
+    /// Central history boundary. When disabled, content writes fail instead of
+    /// silently persisting, and reads/deletes of existing history keep working.
+    pub fn set_history_writes(&self, enabled: bool) {
+        self.history_writes.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_tool_output_writes(&self, enabled: bool) {
+        self.tool_output_writes.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn history_writes_enabled(&self) -> bool {
+        self.history_writes.load(Ordering::Relaxed)
+    }
+
+    fn require_history_writes(&self) -> Result<(), StorageError> {
+        if self.history_writes_enabled() {
+            Ok(())
+        } else {
+            Err(StorageError::HistoryDisabled)
+        }
     }
 
     fn migrate(&mut self) -> Result<(), StorageError> {
@@ -204,6 +262,7 @@ impl Storage {
         title: &str,
         system_prompt: &str,
     ) -> Result<ConversationId, StorageError> {
+        self.require_history_writes()?;
         let now = unix_time_now();
         self.connection.execute(
             "INSERT INTO conversations
@@ -362,12 +421,14 @@ impl Storage {
         conversation_id: ConversationId,
         message: NewMessage<'_>,
     ) -> Result<MessageId, StorageError> {
+        self.require_history_writes()?;
         let now = unix_time_now();
-        let tool_calls_json = if message.tool_calls.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(message.tool_calls)?)
-        };
+        let tool_calls_json =
+            if message.tool_calls.is_empty() || !self.tool_output_writes.load(Ordering::Relaxed) {
+                None
+            } else {
+                Some(serde_json::to_string(message.tool_calls)?)
+            };
         let usage = message.usage;
         let cost = message.cost;
         self.connection.execute(
@@ -409,6 +470,7 @@ impl Storage {
     }
 
     pub fn rename_conversation(&self, id: ConversationId, title: &str) -> Result<(), StorageError> {
+        self.require_history_writes()?;
         self.connection.execute(
             "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
             params![title.trim(), unix_time_now() as i64, id],
@@ -423,6 +485,7 @@ impl Storage {
         protocol: Protocol,
         model: &str,
     ) -> Result<(), StorageError> {
+        self.require_history_writes()?;
         self.connection.execute(
             "UPDATE conversations SET provider_id = ?1, protocol = ?2, model = ?3,
                     updated_at = ?4 WHERE id = ?5",
@@ -442,6 +505,7 @@ impl Storage {
         id: ConversationId,
         system_prompt: &str,
     ) -> Result<(), StorageError> {
+        self.require_history_writes()?;
         self.connection.execute(
             "UPDATE conversations SET system_prompt = ?1, updated_at = ?2 WHERE id = ?3",
             params![system_prompt, unix_time_now() as i64, id],
@@ -498,27 +562,151 @@ impl Storage {
     pub fn conversation_usage(
         &self,
         conversation_id: ConversationId,
-    ) -> Result<Option<(u64, u64, Option<String>, f64)>, StorageError> {
-        let row = self
-            .connection
-            .query_row(
-                "SELECT COALESCE(SUM(input_tokens), 0),
-                        COALESCE(SUM(output_tokens), 0),
-                        MAX(currency), COALESCE(SUM(estimated_cost), 0)
-                 FROM messages
-                 WHERE conversation_id = ?1 AND role = 'assistant'",
-                [conversation_id],
-                |row| {
-                    Ok((
-                        from_i64(row.get(0)?, "input_tokens")?,
-                        from_i64(row.get(1)?, "output_tokens")?,
-                        row.get(2)?,
-                        row.get(3)?,
-                    ))
-                },
-            )
-            .optional()?;
-        Ok(row)
+    ) -> Result<Option<ConversationUsage>, StorageError> {
+        let row = self.connection.query_row(
+            "SELECT COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    MAX(currency), COALESCE(SUM(estimated_cost), 0)
+             FROM messages
+             WHERE conversation_id = ?1 AND role = 'assistant'",
+            [conversation_id],
+            |row| {
+                Ok(ConversationUsage {
+                    input_tokens: from_i64(row.get(0)?, "input_tokens")?,
+                    output_tokens: from_i64(row.get(1)?, "output_tokens")?,
+                    currency: row.get(2)?,
+                    estimated_cost: row.get(3)?,
+                })
+            },
+        )?;
+        Ok(Some(row))
+    }
+
+    /// Title and message-body search, bounded to 200 rows.
+    pub fn search_conversations(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<ConversationSummary>, StorageError> {
+        let limit = limit.clamp(1, 200);
+        let query = query.trim();
+        if query.is_empty() {
+            return self.list_conversations(limit);
+        }
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let mut statement = self.connection.prepare(
+            "SELECT c.id, c.title, c.provider_id, c.model, c.updated_at,
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id)
+             FROM conversations c
+             WHERE c.title LIKE ?1 ESCAPE '\\'
+                OR EXISTS (
+                    SELECT 1 FROM messages m
+                    WHERE m.conversation_id = c.id
+                      AND m.content LIKE ?1 ESCAPE '\\'
+                )
+             ORDER BY c.updated_at DESC, c.id DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![pattern, limit as i64], |row| {
+            Ok(ConversationSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                provider_id: from_i64(row.get(2)?, "provider_id")?,
+                model: row.get(3)?,
+                updated_at: from_i64(row.get(4)?, "updated_at")?,
+                message_count: from_i64(row.get(5)?, "message_count")?,
+            })
+        })?;
+        let mut conversations = Vec::new();
+        for row in rows {
+            conversations.push(row?);
+        }
+        Ok(conversations)
+    }
+
+    pub fn usage_totals(&self) -> Result<UsageTotals, StorageError> {
+        let (input_tokens, output_tokens, cached_input_tokens) = self.connection.query_row(
+            "SELECT COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cached_input_tokens), 0)
+             FROM messages WHERE role = 'assistant'",
+            [],
+            |row| {
+                Ok((
+                    from_i64(row.get(0)?, "input_tokens")?,
+                    from_i64(row.get(1)?, "output_tokens")?,
+                    from_i64(row.get(2)?, "cached_input_tokens")?,
+                ))
+            },
+        )?;
+        let mut statement = self.connection.prepare(
+            "SELECT currency, COALESCE(SUM(estimated_cost), 0)
+             FROM messages
+             WHERE role = 'assistant' AND currency IS NOT NULL
+             GROUP BY currency ORDER BY currency",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get(1)?)))?;
+        let mut costs = Vec::new();
+        for row in rows {
+            costs.push(row?);
+        }
+        Ok(UsageTotals {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            costs,
+        })
+    }
+
+    /// Daily token totals for the most recent `days`, bucketed in UTC.
+    pub fn usage_by_day(&self, days: u32) -> Result<Vec<UsageDay>, StorageError> {
+        let days = days.clamp(1, 365);
+        let cutoff = unix_time_now().saturating_sub(u64::from(days) * 86_400);
+        let mut statement = self.connection.prepare(
+            "SELECT created_at, input_tokens, output_tokens, cached_input_tokens,
+                    estimated_cost, currency
+             FROM messages
+             WHERE role = 'assistant' AND created_at >= ?1
+             ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([cutoff as i64], |row| {
+            Ok((
+                from_i64(row.get(0)?, "created_at")?,
+                opt_i64(row.get(1)?),
+                opt_i64(row.get(2)?),
+                opt_i64(row.get(3)?),
+                row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut days_map: BTreeMap<u64, UsageDay> = BTreeMap::new();
+        for row in rows {
+            let (created_at, input, output, cached, cost, currency) = row?;
+            let day_start_utc = created_at - created_at % 86_400;
+            let day = days_map.entry(day_start_utc).or_insert_with(|| UsageDay {
+                day_start_utc,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                costs: Vec::new(),
+            });
+            day.input_tokens = day.input_tokens.saturating_add(input);
+            day.output_tokens = day.output_tokens.saturating_add(output);
+            day.cached_input_tokens = day.cached_input_tokens.saturating_add(cached);
+            if let Some(currency) = currency
+                && cost != 0.0
+            {
+                match day.costs.iter_mut().find(|(name, _)| *name == currency) {
+                    Some((_, total)) => *total += cost,
+                    None => day.costs.push((currency, cost)),
+                }
+            }
+        }
+        Ok(days_map.into_values().collect())
     }
 
     pub fn conversation_count(&self) -> Result<u64, StorageError> {
@@ -549,48 +737,6 @@ impl Storage {
             )?;
         }
         Ok(removed)
-    }
-
-    pub fn insert_tool_call(
-        &self,
-        conversation_id: ConversationId,
-        message_id: Option<MessageId>,
-        server_id: u64,
-        server_name: &str,
-        tool_name: &str,
-        arguments_json: &str,
-    ) -> Result<i64, StorageError> {
-        self.connection.execute(
-            "INSERT INTO tool_calls
-             (conversation_id, message_id, server_id, server_name, tool_name,
-              arguments_json, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
-            params![
-                conversation_id,
-                message_id,
-                server_id as i64,
-                server_name,
-                tool_name,
-                arguments_json,
-                unix_time_now() as i64,
-            ],
-        )?;
-        Ok(self.connection.last_insert_rowid())
-    }
-
-    pub fn complete_tool_call(
-        &self,
-        id: i64,
-        status: &str,
-        result_text: Option<&str>,
-        error: Option<&str>,
-    ) -> Result<(), StorageError> {
-        self.connection.execute(
-            "UPDATE tool_calls SET status = ?1, result_text = ?2, error = ?3,
-                    completed_at = ?4 WHERE id = ?5",
-            params![status, result_text, error, unix_time_now() as i64, id],
-        )?;
-        Ok(())
     }
 }
 
@@ -744,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_calls_and_results_round_trip() {
+    fn tool_outputs_respect_the_toggle() {
         let storage = Storage::open_in_memory().unwrap();
         let id = storage
             .create_conversation(1, Protocol::OpenAiChat, "auto", "Tools", "")
@@ -754,6 +900,7 @@ mod tests {
             name: "files__read".into(),
             arguments: "{\"path\":\"/tmp/a\"}".into(),
         }];
+        storage.set_tool_output_writes(false);
         storage
             .append_message(
                 id,
@@ -766,14 +913,152 @@ mod tests {
             )
             .unwrap();
         let messages = storage.load_messages(id, 10).unwrap();
-        assert_eq!(messages[0].tool_calls, calls);
+        assert!(messages[0].tool_calls.is_empty());
 
-        let tool_id = storage
-            .insert_tool_call(id, Some(messages[0].id), 2, "Files", "files__read", "{}")
+        storage.set_tool_output_writes(true);
+        storage
+            .append_message(
+                id,
+                NewMessage {
+                    role: MessageRole::Assistant,
+                    content: "checking again",
+                    tool_calls: &calls,
+                    ..new_message(MessageRole::Assistant, "")
+                },
+            )
+            .unwrap();
+        let messages = storage.load_messages(id, 10).unwrap();
+        assert_eq!(messages[1].tool_calls, calls);
+    }
+
+    #[test]
+    fn history_gate_blocks_content_writes_but_allows_deletion() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage
+            .create_conversation(1, Protocol::OpenAiChat, "auto", "Kept", "")
             .unwrap();
         storage
-            .complete_tool_call(tool_id, "ok", Some("result"), None)
+            .append_message(id, new_message(MessageRole::User, "old"))
             .unwrap();
+
+        storage.set_history_writes(false);
+        assert!(matches!(
+            storage.create_conversation(1, Protocol::OpenAiChat, "auto", "Nope", ""),
+            Err(StorageError::HistoryDisabled)
+        ));
+        assert!(matches!(
+            storage.append_message(id, new_message(MessageRole::User, "nope")),
+            Err(StorageError::HistoryDisabled)
+        ));
+        assert!(matches!(
+            storage.rename_conversation(id, "Nope"),
+            Err(StorageError::HistoryDisabled)
+        ));
+        assert_eq!(storage.conversation_count().unwrap(), 1);
+        storage.delete_conversation(id).unwrap();
+        assert_eq!(storage.conversation_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn search_finds_titles_and_message_bodies_with_a_bound() {
+        let storage = Storage::open_in_memory().unwrap();
+        let alpha = storage
+            .create_conversation(1, Protocol::OpenAiChat, "auto", "Alpha notes", "")
+            .unwrap();
+        storage
+            .append_message(
+                alpha,
+                new_message(MessageRole::User, "a body mention of nebula"),
+            )
+            .unwrap();
+        let beta = storage
+            .create_conversation(1, Protocol::OpenAiChat, "auto", "Beta", "")
+            .unwrap();
+        storage
+            .append_message(beta, new_message(MessageRole::User, "unrelated"))
+            .unwrap();
+
+        let by_title = storage.search_conversations("alpha", 200).unwrap();
+        assert_eq!(by_title.len(), 1);
+        assert_eq!(by_title[0].title, "Alpha notes");
+        let by_body = storage.search_conversations("nebula", 200).unwrap();
+        assert_eq!(by_body.len(), 1);
+        assert_eq!(by_body[0].id, alpha);
+        assert!(storage.search_conversations("   ", 200).unwrap().len() == 2);
+        assert!(storage.search_conversations("%", 200).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_never_returns_more_than_two_hundred_rows() {
+        let storage = Storage::open_in_memory().unwrap();
+        for index in 0..205 {
+            storage
+                .create_conversation(
+                    1,
+                    Protocol::OpenAiChat,
+                    "auto",
+                    &format!("Searchable {index}"),
+                    "",
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            storage
+                .search_conversations("Searchable", 10_000)
+                .unwrap()
+                .len(),
+            200
+        );
+    }
+
+    #[test]
+    fn usage_totals_and_daily_buckets_do_not_double_count() {
+        let storage = Storage::open_in_memory().unwrap();
+        let id = storage
+            .create_conversation(1, Protocol::OpenAiChat, "auto", "Usage", "")
+            .unwrap();
+        for (input, output) in [(10_u64, 4_u64), (6, 2)] {
+            storage
+                .append_message(
+                    id,
+                    NewMessage {
+                        role: MessageRole::Assistant,
+                        content: "x",
+                        usage: Some(&TokenUsage {
+                            input_tokens: input,
+                            output_tokens: output,
+                            cached_input_tokens: 1,
+                        }),
+                        cost: Some(&CostEstimate {
+                            amount: 0.001,
+                            currency: "USD".into(),
+                            input_price_per_mtok: 1.0,
+                            output_price_per_mtok: 2.0,
+                            cached_input_price_per_mtok: None,
+                        }),
+                        provider_id: Some(7),
+                        protocol: Some(Protocol::OpenAiChat),
+                        model: Some("auto"),
+                        ..new_message(MessageRole::Assistant, "")
+                    },
+                )
+                .unwrap();
+        }
+        let totals = storage.usage_totals().unwrap();
+        assert_eq!(totals.input_tokens, 16);
+        assert_eq!(totals.output_tokens, 6);
+        assert_eq!(totals.cached_input_tokens, 2);
+        assert_eq!(totals.costs, vec![("USD".to_owned(), 0.002)]);
+
+        let days = storage.usage_by_day(7).unwrap();
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].input_tokens, 16);
+        assert_eq!(days[0].output_tokens, 6);
+        assert_eq!(days[0].day_start_utc % 86_400, 0);
+
+        let usage = storage.conversation_usage(id).unwrap().unwrap();
+        assert_eq!(usage.input_tokens, 16);
+        assert_eq!(usage.currency.as_deref(), Some("USD"));
     }
 
     #[test]

@@ -60,6 +60,16 @@
 - This supports compatible endpoints/gateways such as FreeLLMAPI; native protocols for other vendors remain future work and must use official documentation.
 - Provider responses are text only. This foundation does not execute an agent, inspect a workspace, or edit files.
 
+## Phase 4.5 — UI, settings, history, and usage polish (supporting milestone)
+
+- Add a dedicated Settings screen: appearance (System/Dark/Light), history retention, tool-output saving, data locations, and Keychain guidance.
+- Enforce the history switch at the storage boundary. With history off, chat continues in memory and no conversation, message, tool-call, or usage rows are written.
+- Add bounded conversation search over titles and message text (200 results), inline rename, delete, clear-all, and relative timestamps.
+- Add a usage dashboard with totals, per-provider, per-model, and per-day views. Costs remain labelled estimates derived from user-configured prices.
+- Add first-run guidance and consistent empty states.
+
+**Exit criteria:** history-off leaves no conversation-linked rows and nothing returns after restart; search is bounded and deterministic; usage views stay bounded; formatting, Clippy with `-D warnings`, tests, and the release build pass.
+
 ## Phase 5 — mission engine
 
 - Task schema: objective, constraints, workspace, budget, privacy, deliverables.

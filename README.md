@@ -1,17 +1,15 @@
 # NEXUS
 
-NEXUS is a native Rust desktop application for AI-agent orchestration. It includes bounded agent discovery, local evidence-based task recommendations, and an explicitly user-triggered OpenAI-compatible provider connection. Provider requests return text; they do not run agents or edit project files. Agent execution, mission orchestration, native non-compatible provider protocols, and child-agent monitoring are not implemented.
+NEXUS is a native Rust desktop workbench for model provider APIs. It connects to OpenAI-compatible Chat Completions endpoints, keeps conversations in local SQLite, stores provider keys in the macOS Keychain, and shows provider-reported token usage.
+
+MCP connections, non-OpenAI protocol adapters, agent execution, and mission orchestration are **not** implemented. The app sends chat completions over the network only when you press Send.
 
 ## Requirements
 
-- Stable Rust toolchain with Cargo and the `aarch64-apple-darwin` target on Apple Silicon macOS.
+- Stable Rust toolchain with Cargo on Apple Silicon macOS.
 - macOS system SDK and linker tools (normally provided by Xcode Command Line Tools).
 
-The CI workflow runs on macOS and checks formatting, Clippy, and unit tests.
-
 ## Build and run
-
-From the repository root:
 
 ```sh
 cargo run
@@ -21,15 +19,10 @@ Create an optimized executable:
 
 ```sh
 cargo build --release
+./target/release/nexus-app
 ```
 
-The executable is `target/release/nexus-app`. This phase does not create a signed or notarized `.app` bundle; packaging requires a later distribution decision.
-
-Build without telemetry for a repeatable enabled/disabled resource comparison:
-
-```sh
-cargo build --release --no-default-features
-```
+The executable is `target/release/nexus-app`. No signed or notarized `.app` bundle is produced yet.
 
 ## Checks
 
@@ -40,28 +33,34 @@ cargo test --workspace
 cargo build --release
 ```
 
-## Configuration and logs
+## Screens
 
-Configuration is loaded from `~/Library/Application Support/NEXUS/config.toml` on macOS. If that file is absent, built-in defaults are used. A minimal override is:
+- **Chat** — conversation sidebar with search, inline rename, delete, clear-all, relative timestamps, streaming responses, system prompts, and per-message token/cost notes.
+- **Providers** — add profiles from presets, edit endpoints and auth, maintain model catalogs and prices, test nothing automatically, and save or remove keys with the macOS Keychain.
+- **Usage** — provider-reported token totals overall, per provider, per model, and per day. Costs are estimates from your configured prices and are labelled as such.
+- **Resources** — NEXUS process RSS, CPU, uptime, and peak. Child processes are not included.
+- **Settings** — appearance (System/Dark/Light), history and retention controls, tool-output saving, data paths with copy buttons, and history deletion.
 
-```toml
-welcome_message = "Your local agent workspace is ready to configure."
-```
+## Data locations
 
-Set `RUST_LOG` to control structured log filtering (for example, `RUST_LOG=debug cargo run`). NEXUS does not scan automatically or start a background service. Agent discovery makes no network requests. Provider credentials are entered by the user and stored in the macOS Keychain; provider requests occur only after the user clicks Send task to provider. Standard Discovery checks eligible `PATH` entries and documented conventional roots only after a user request. Expanded System Discovery is a separate consent-gated option. The exact macOS locations and exclusions are listed in [the discovery catalog](docs/ADAPTERS.md#discovery-roots).
+On macOS:
 
-Tokio is deferred until a bounded asynchronous operation is introduced. Resource sampling uses a stoppable standard-library thread; explicit agent discovery uses a short-lived, cancelable standard-library thread.
+- Configuration: `~/Library/Application Support/NEXUS/config.toml`
+- Database: `~/Library/Application Support/NEXUS/nexus.db`
+- Provider keys: macOS Keychain, service `com.nexus.app.credentials`, scoped per profile and endpoint origin.
 
-## Task routing
+No API key is written to the configuration file, the database, or logs.
 
-The Routing screen accepts a bounded task description, a user-selected category, mandatory requirements, and optional preferences. Results use a small in-code capability catalog and the local registry snapshot. Current catalog evidence documents software-development workflows only; other capability dimensions remain unknown. Documentation-only claims yield tentative recommendations, while unknown mandatory requirements prevent a recommendation. Task text and manual selection remain in memory for the current UI session and are not logged or persisted. See [the architecture](docs/ARCHITECTURE.md#phase-3-task-routing) and [adapter evidence policy](docs/ADAPTERS.md#phase-3-capability-evidence-and-routing).
+## History and privacy
 
-Agent rescans also check the exact supported macOS app bundles listed in [the discovery catalog](docs/ADAPTERS.md#supported-macos-application-bundles). App presence is recorded separately from CLI discovery and does not imply NEXUS can control the app.
+- With history enabled, completed conversations and provider usage are saved locally in SQLite (plaintext at rest, file permissions `0600`).
+- With history disabled, chat works normally but conversations exist only in memory. No conversation, message, tool-call, or usage rows are written, and nothing returns after restart. Settings states that usage data is therefore unavailable in that mode.
+- Search covers saved titles and message text only, capped at 200 results.
+- **Clear all history** deletes conversations, messages, and conversation-linked usage. It does not touch providers, keys, or settings.
 
-## Provider connection
+## Limitations
 
-The Providers screen accepts one OpenAI-compatible Chat Completions endpoint and model identifier. This can be a compatible hosted API or a local gateway such as FreeLLMAPI; the protocol is not universal, so native Anthropic Messages, Gemini, and other distinct APIs are not claimed to work yet. Enter a provider-issued key yourself and save it to macOS Keychain. NEXUS neither searches for nor imports existing keys. On the Routing screen, **Send task to provider** is the explicit action that transmits the task text; remote use may incur charges. The response is displayed in NEXUS, but the provider does not edit files or execute an agent. See [provider and security boundaries](docs/SECURITY.md#explicit-provider-requests).
-
-## Resource use
-
-The Resource Monitor reports NEXUS RSS, not macOS physical footprint, and keeps ten minutes of samples in memory. Discovery is bounded and read-only; custom search folders authorize passive exact-name checks directly inside the selected folder only. Discovery never executes tools or inspects their credentials or configuration. Registry detections are not proof that an agent is authenticated, connectable, usable, or controllable by NEXUS. The targets in [docs/RESOURCE_BUDGET.md](docs/RESOURCE_BUDGET.md) remain targets, not guarantees.
+- Only the OpenAI-compatible Chat Completions protocol sends requests. Anthropic, OpenAI Responses, Gemini, and Ollama profiles can be configured but return an unsupported-protocol error if sent.
+- MCP configuration types exist, but no MCP client, tool discovery, or tool execution is implemented.
+- Usage cost is never invented: a value appears only when both provider usage and model prices exist.
+- The repository roadmap still describes earlier agent-platform phases; see [docs/ROADMAP.md](docs/ROADMAP.md) for the Phase 4.5 supporting milestone and the preserved Phase 5/6 objectives.

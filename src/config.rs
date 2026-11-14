@@ -234,17 +234,6 @@ pub enum McpTransport {
     StreamableHttp,
 }
 
-impl McpTransport {
-    pub const ALL: [Self; 2] = [Self::Stdio, Self::StreamableHttp];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Stdio => "Local process (stdio)",
-            Self::StreamableHttp => "Streamable HTTP",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct McpServerConfig {
     pub id: u64,
@@ -267,38 +256,6 @@ pub struct McpServerConfig {
     pub enabled_tools: Vec<String>,
 }
 
-impl McpServerConfig {
-    pub fn stdio(id: u64, name: impl Into<String>, command: impl Into<String>) -> Self {
-        Self {
-            id,
-            name: name.into(),
-            transport: McpTransport::Stdio,
-            command: command.into(),
-            args: Vec::new(),
-            cwd: None,
-            env_allowlist: Vec::new(),
-            url: String::new(),
-            bearer_auth: false,
-            enabled_tools: Vec::new(),
-        }
-    }
-
-    pub fn http(id: u64, name: impl Into<String>, url: impl Into<String>) -> Self {
-        Self {
-            id,
-            name: name.into(),
-            transport: McpTransport::StreamableHttp,
-            command: String::new(),
-            args: Vec::new(),
-            cwd: None,
-            env_allowlist: Vec::new(),
-            url: url.into(),
-            bearer_auth: false,
-            enabled_tools: Vec::new(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_config_version")]
@@ -315,10 +272,15 @@ pub struct Config {
     pub mcp_sequence: u64,
     #[serde(default = "default_true")]
     pub history_enabled: bool,
-    #[serde(default = "default_retention_days")]
+    #[serde(
+        default = "default_retention_days",
+        deserialize_with = "deserialize_retention_days"
+    )]
     pub history_retention_days: u32,
     #[serde(default = "default_true")]
     pub save_tool_outputs: bool,
+    #[serde(default)]
+    pub first_run_callout_dismissed: bool,
     #[serde(default)]
     pub theme: Theme,
     // Phase 3 compatibility. These keys are read once and never written back.
@@ -342,6 +304,15 @@ fn default_retention_days() -> u32 {
     365
 }
 
+/// Accept legacy or hand-edited values and clamp them instead of failing startup.
+fn deserialize_retention_days<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = i64::deserialize(deserializer)?;
+    Ok(value.clamp(1, 3_650) as u32)
+}
+
 impl Default for Config {
     fn default() -> Self {
         let profile = ProviderProfile::new(
@@ -362,6 +333,7 @@ impl Default for Config {
             history_enabled: true,
             history_retention_days: default_retention_days(),
             save_tool_outputs: true,
+            first_run_callout_dismissed: false,
             theme: Theme::System,
             legacy_provider_base_url: None,
             legacy_provider_model: None,
@@ -597,32 +569,6 @@ impl Config {
         }
         true
     }
-
-    pub fn mcp_server(&self, id: u64) -> Option<&McpServerConfig> {
-        self.mcp_servers.iter().find(|server| server.id == id)
-    }
-
-    pub fn allocate_mcp_server_id(&mut self) -> u64 {
-        self.mcp_sequence = self
-            .mcp_sequence
-            .max(
-                self.mcp_servers
-                    .iter()
-                    .map(|server| server.id)
-                    .max()
-                    .unwrap_or(0),
-            )
-            .saturating_add(1);
-        self.mcp_sequence
-    }
-
-    pub fn remove_mcp_server(&mut self, id: u64) -> bool {
-        let Some(index) = self.mcp_servers.iter().position(|server| server.id == id) else {
-            return false;
-        };
-        self.mcp_servers.remove(index);
-        true
-    }
 }
 
 #[cfg(test)]
@@ -836,21 +782,58 @@ mod tests {
     }
 
     #[test]
-    fn mcp_servers_round_trip_and_ids_are_allocated_once() {
+    fn theme_and_history_flags_survive_a_round_trip_without_losing_providers() {
+        let mut config = Config {
+            theme: Theme::Dark,
+            history_enabled: false,
+            ..Config::default()
+        };
+        config.providers[0].name = "Kept provider".to_owned();
+        let path = std::env::temp_dir().join(format!(
+            "nexus-config-{}-theme/config.toml",
+            std::process::id()
+        ));
+        config.save(&path).unwrap();
+        let loaded = Config::load_or_default(&path).unwrap();
+        assert_eq!(loaded.theme, Theme::Dark);
+        assert!(!loaded.history_enabled);
+        assert_eq!(loaded.providers[0].name, "Kept provider");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn mcp_servers_round_trip_through_the_config_file() {
         let mut config = Config::default();
-        let id = config.allocate_mcp_server_id();
-        config
-            .mcp_servers
-            .push(McpServerConfig::stdio(id, "Files", "npx"));
+        config.providers.clear();
+        config.providers.push(ProviderProfile::new(
+            1,
+            "Local gateway",
+            Protocol::OpenAiChat,
+            "http://127.0.0.1:3001/v1",
+            AuthMode::None,
+            "auto",
+        ));
+        config.mcp_servers.push(McpServerConfig {
+            id: 4,
+            name: "Files".to_owned(),
+            transport: McpTransport::Stdio,
+            command: "npx".to_owned(),
+            args: vec!["-y".to_owned(), "server-files".to_owned()],
+            cwd: None,
+            env_allowlist: vec!["HOME".to_owned()],
+            url: String::new(),
+            bearer_auth: false,
+            enabled_tools: Vec::new(),
+        });
         let path = std::env::temp_dir().join(format!(
             "nexus-config-{}-mcp/config.toml",
             std::process::id()
         ));
         config.save(&path).unwrap();
-        let mut loaded = Config::load_or_default(&path).unwrap();
+        let loaded = Config::load_or_default(&path).unwrap();
         assert_eq!(loaded.mcp_servers.len(), 1);
-        assert_eq!(loaded.allocate_mcp_server_id(), id + 1);
-        assert!(loaded.remove_mcp_server(id));
+        assert_eq!(loaded.mcp_servers[0].transport, McpTransport::Stdio);
+        assert_eq!(loaded.mcp_servers[0].command, "npx");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

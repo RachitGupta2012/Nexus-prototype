@@ -149,7 +149,6 @@ pub enum ProviderError {
 pub struct ProviderController {
     receiver: Receiver<ChatEvent>,
     cancel: watch::Sender<bool>,
-    finished: bool,
 }
 
 impl ProviderController {
@@ -197,7 +196,6 @@ impl ProviderController {
         Ok(Self {
             receiver,
             cancel: cancel_sender,
-            finished: false,
         })
     }
 
@@ -207,10 +205,7 @@ impl ProviderController {
             match self.receiver.try_recv() {
                 Ok(event) => events.push(event),
                 Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.finished = true;
-                    break;
-                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
         events
@@ -218,10 +213,6 @@ impl ProviderController {
 
     pub fn cancel(&self) {
         let _ = self.cancel.send(true);
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.finished
     }
 }
 

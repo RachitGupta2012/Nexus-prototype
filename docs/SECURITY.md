@@ -61,3 +61,14 @@
 ## macOS application discovery
 
 An explicit discovery scan checks only the exact `DeepAI Code.app` and `OpenCode.app` bundle paths under `/Applications` and `~/Applications`. The check is nonrecursive and uses metadata only; it does not open bundles, read their manifests or contents, or launch applications. Application presence is reported separately from CLI detection and grants no control or execution permission.
+
+
+## Phase 4.5 history, usage, and settings
+
+- History is controlled by one storage-level write gate. When history is off, conversation-, message-, and tool-output writes fail instead of silently persisting, and the chat controller keeps the active conversation in memory with negative synthetic ids.
+- No autosave, shutdown hook, background task, or UI helper writes conversation content while history is off. Restarting does not restore those conversations, and they never appear in search.
+- Usage is stored only inside saved message rows. With history off, no token or cost records are written, and Settings states this limitation rather than claiming aggregate-only usage is kept.
+- Tool-call arguments and results are stored only when both history and the tool-output setting are enabled. History-off overrides the tool-output setting.
+- Search reads saved conversations only; it cannot surface memory-only conversations and is bounded to 200 results.
+- Clearing history deletes conversations, messages, and conversation-linked usage. It does not delete provider profiles, Keychain credentials, application settings, or the configuration file.
+- Theme, retention, and history preferences are stored in the TOML configuration; provider keys never are. Data-location copy buttons expose paths only, never credential contents.

@@ -9,8 +9,6 @@ use crate::config::{ModelPricing, Protocol};
 pub const MAX_USER_MESSAGE_BYTES: usize = 32 * 1024;
 pub const MAX_ASSISTANT_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
-pub const MAX_TOOL_RESULT_BYTES: usize = 1024 * 1024;
-pub const MAX_TOOL_ROUNDS: u8 = 8;
 pub const MAX_TOOL_CALLS_PER_TURN: usize = 16;
 pub const MAX_SYSTEM_PROMPT_BYTES: usize = 16 * 1024;
 
@@ -167,16 +165,6 @@ pub struct StoredMessage {
     pub usage: Option<TokenUsage>,
     #[serde(default)]
     pub cost: Option<CostEstimate>,
-}
-
-impl StoredMessage {
-    pub fn is_assistant(&self) -> bool {
-        self.role == MessageRole::Assistant
-    }
-
-    pub fn is_tool(&self) -> bool {
-        self.role == MessageRole::Tool
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

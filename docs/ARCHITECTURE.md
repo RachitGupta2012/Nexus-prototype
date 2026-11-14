@@ -81,3 +81,12 @@ Application bundles have a separate typed detection record rather than being rep
 `provider.rs` implements a narrow direct provider client for OpenAI-compatible Chat Completions. It is separate from the pure `routing.rs` recommendation engine and from the discovered agent registry. A compatible local gateway (including a FreeLLMAPI-style gateway) can provide model selection/routing by using its documented base URL and model selector; NEXUS does not claim to support every vendor API protocol.
 
 Non-secret endpoint and model settings live in `config.toml`. On macOS, a user-entered provider key is stored through the OS Keychain and is not serialized or logged. Keychain reads happen only on the worker spawned by an explicit **Send task to provider** action. That operation sends the user's task description to the configured endpoint and displays a text response. It never launches a discovered agent, changes files, or authorizes execution. Requests use HTTPS for remote endpoints, allow plain HTTP only for loopback, do not follow redirects, have a total timeout, and cap the response body. The UI thread remains responsive while the bounded request is in flight.
+
+
+## Phase 4.5 UI and history boundary
+
+The desktop shell routes six sections: Chat, Providers, MCP, Usage, Resources, and Settings. Settings owns appearance and history preferences; Providers owns profiles, model catalogs, prices, and Keychain actions; Usage reads bounded aggregates from SQLite.
+
+Persistence has one boundary. `Storage` carries a history-write gate and a tool-output gate. Content writes return `HistoryDisabled` when the gate is closed, while reads, deletion, and pruning stay available. `ChatController` checks the same policy so chat keeps working without a database row, using negative conversation and message ids to mark memory-only state. This avoids a second storage implementation and keeps UI conditionals from being the only enforcement point.
+
+Usage is derived from saved assistant messages rather than a separate aggregate table. That keeps history-off truly contentless but also means no usage dashboard data exists while history is off. Search is a bounded `LIKE` query over titles and message bodies; there is no full-text index and results are capped at 200.

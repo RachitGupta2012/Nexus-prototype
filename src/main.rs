@@ -27,7 +27,7 @@ fn main() -> Result<(), AppError> {
     let config = Config::load_or_default(&config_path)?;
     let database_path = app_support_path("nexus.db")?;
     let storage = Storage::open(&database_path)?;
-    ui::run(config, config_path, storage)?;
+    ui::run(config, config_path, database_path, storage)?;
     Ok(())
 }
 

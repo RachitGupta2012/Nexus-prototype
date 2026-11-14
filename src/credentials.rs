@@ -6,6 +6,7 @@
 pub enum CredentialError {
     #[error("credential is empty or too long")]
     InvalidSecret,
+    #[cfg(not(target_os = "macos"))]
     #[error("credential storage is unavailable on this platform")]
     Unsupported,
     #[error("the macOS Keychain could not be accessed")]
@@ -17,10 +18,6 @@ const MAX_SECRET_BYTES: usize = 16_384;
 
 pub fn provider_account(profile_id: u64, origin: &str) -> String {
     format!("provider:{profile_id}|{origin}")
-}
-
-pub fn mcp_account(server_id: u64, origin: &str) -> String {
-    format!("mcp:{server_id}|{origin}")
 }
 
 fn validate_secret(secret: &str) -> Result<&str, CredentialError> {
@@ -92,10 +89,6 @@ mod tests {
         assert_ne!(
             provider_account(1, "https://a.example"),
             provider_account(1, "https://b.example")
-        );
-        assert_eq!(
-            mcp_account(3, "http://127.0.0.1:9000"),
-            "mcp:3|http://127.0.0.1:9000"
         );
     }
 
