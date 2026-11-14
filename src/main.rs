@@ -1,13 +1,9 @@
-mod agent;
-mod application;
-mod capability;
+mod chat;
 mod config;
-mod discovery;
+mod credentials;
 mod error;
 mod provider;
-mod registry;
-mod routing;
-mod task;
+mod storage;
 #[cfg(feature = "telemetry")]
 mod telemetry;
 mod ui;
@@ -16,6 +12,7 @@ use std::path::PathBuf;
 
 use config::Config;
 use error::AppError;
+use storage::Storage;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), AppError> {
@@ -26,10 +23,11 @@ fn main() -> Result<(), AppError> {
         "Starting NEXUS"
     );
 
-    let config_path = config_path()?;
+    let config_path = app_support_path("config.toml")?;
     let config = Config::load_or_default(&config_path)?;
-    let registry_path = config_path.with_file_name("registry.toml");
-    ui::run(config, config_path, registry_path)?;
+    let database_path = app_support_path("nexus.db")?;
+    let storage = Storage::open(&database_path)?;
+    ui::run(config, config_path, storage)?;
     Ok(())
 }
 
@@ -38,23 +36,14 @@ fn init_logging() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-fn config_path() -> Result<PathBuf, AppError> {
+fn app_support_path(file_name: &str) -> Result<PathBuf, AppError> {
+    let home = std::env::var_os("HOME").ok_or(AppError::MissingHomeDirectory)?;
     #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var_os("HOME").ok_or(AppError::MissingHomeDirectory)?;
-        Ok(PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("NEXUS")
-            .join("config.toml"))
-    }
-
+    let root = PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("NEXUS");
     #[cfg(not(target_os = "macos"))]
-    {
-        let home = std::env::var_os("HOME").ok_or(AppError::MissingHomeDirectory)?;
-        Ok(PathBuf::from(home)
-            .join(".config")
-            .join("nexus")
-            .join("config.toml"))
-    }
+    let root = PathBuf::from(home).join(".config").join("nexus");
+    Ok(root.join(file_name))
 }

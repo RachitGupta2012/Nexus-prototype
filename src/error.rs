@@ -25,6 +25,8 @@ pub enum AppError {
     },
     #[error("could not locate the user's home directory")]
     MissingHomeDirectory,
+    #[error(transparent)]
+    Storage(#[from] crate::storage::StorageError),
     #[error("could not start the native application window")]
     Window(#[from] eframe::Error),
 }

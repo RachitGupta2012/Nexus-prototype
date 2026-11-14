@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -5,20 +6,366 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+pub const CONFIG_VERSION: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Theme {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+impl Theme {
+    pub const ALL: [Self; 3] = [Self::System, Self::Dark, Self::Light];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol {
+    OpenAiChat,
+    OpenAiResponses,
+    AnthropicMessages,
+    GeminiGenerateContent,
+    OllamaChat,
+}
+
+impl Protocol {
+    pub const ALL: [Self; 5] = [
+        Self::OpenAiChat,
+        Self::OpenAiResponses,
+        Self::AnthropicMessages,
+        Self::GeminiGenerateContent,
+        Self::OllamaChat,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "OpenAI Chat Completions",
+            Self::OpenAiResponses => "OpenAI Responses",
+            Self::AnthropicMessages => "Anthropic Messages",
+            Self::GeminiGenerateContent => "Google Gemini",
+            Self::OllamaChat => "Ollama native",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "OpenAI Chat",
+            Self::OpenAiResponses => "OpenAI Responses",
+            Self::AnthropicMessages => "Anthropic",
+            Self::GeminiGenerateContent => "Gemini",
+            Self::OllamaChat => "Ollama",
+        }
+    }
+
+    pub const fn default_base_url(self) -> &'static str {
+        match self {
+            Self::OpenAiChat | Self::OpenAiResponses => "https://api.openai.com/v1",
+            Self::AnthropicMessages => "https://api.anthropic.com/v1",
+            Self::GeminiGenerateContent => "https://generativelanguage.googleapis.com/v1beta",
+            Self::OllamaChat => "http://127.0.0.1:11434",
+        }
+    }
+
+    pub const fn default_auth(self) -> AuthMode {
+        match self {
+            Self::OpenAiChat | Self::OpenAiResponses => AuthMode::Bearer,
+            Self::AnthropicMessages => AuthMode::XApiKey,
+            Self::GeminiGenerateContent => AuthMode::XGoogApiKey,
+            Self::OllamaChat => AuthMode::None,
+        }
+    }
+
+    pub const fn allowed_auth(self) -> &'static [AuthMode] {
+        match self {
+            Self::OpenAiChat | Self::OpenAiResponses => &[AuthMode::Bearer, AuthMode::None],
+            Self::AnthropicMessages => &[AuthMode::XApiKey],
+            Self::GeminiGenerateContent => &[AuthMode::XGoogApiKey],
+            Self::OllamaChat => &[AuthMode::None],
+        }
+    }
+
+    pub const fn supports_tools(self) -> bool {
+        // Adapters may still reject a specific model's schema.
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    None,
+    #[default]
+    Bearer,
+    XApiKey,
+    XGoogApiKey,
+}
+
+impl AuthMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "No API key",
+            Self::Bearer => "Bearer token",
+            Self::XApiKey => "x-api-key",
+            Self::XGoogApiKey => "x-goog-api-key",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelPricing {
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    #[serde(default)]
+    pub cached_input_per_mtok: Option<f64>,
+    #[serde(default = "default_currency")]
+    pub currency: String,
+    #[serde(default)]
+    pub reviewed_at_unix_secs: Option<u64>,
+}
+
+fn default_currency() -> String {
+    "USD".to_owned()
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelConfig {
+    pub id: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub supports_tools: Option<bool>,
+    #[serde(default)]
+    pub pricing: Option<ModelPricing>,
+}
+
+impl ModelConfig {
+    pub fn new(id: impl Into<String>) -> Self {
+        let id = id.into();
+        Self {
+            display_name: id.clone(),
+            id,
+            context_window: None,
+            supports_tools: None,
+            pricing: None,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        if self.display_name.trim().is_empty() {
+            &self.id
+        } else {
+            &self.display_name
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderProfile {
+    pub id: u64,
+    pub name: String,
+    #[serde(default = "default_protocol")]
+    pub protocol: Protocol,
+    pub base_url: String,
+    #[serde(default)]
+    pub auth: AuthMode,
+    #[serde(default, alias = "model")]
+    pub default_model: String,
+    #[serde(default)]
+    pub models: Vec<ModelConfig>,
+}
+
+fn default_protocol() -> Protocol {
+    Protocol::OpenAiChat
+}
+
+impl ProviderProfile {
+    pub fn new(
+        id: u64,
+        name: impl Into<String>,
+        protocol: Protocol,
+        base_url: impl Into<String>,
+        auth: AuthMode,
+        model: impl Into<String>,
+    ) -> Self {
+        let model = model.into();
+        Self {
+            id,
+            name: name.into(),
+            protocol,
+            base_url: base_url.into(),
+            auth,
+            default_model: model.clone(),
+            models: vec![ModelConfig::new(model)],
+        }
+    }
+
+    pub fn model(&self, id: &str) -> Option<&ModelConfig> {
+        self.models.iter().find(|model| model.id == id)
+    }
+
+    pub fn ensure_model(&mut self, id: &str) {
+        if id.trim().is_empty() {
+            return;
+        }
+        if !self.models.iter().any(|model| model.id == id) {
+            self.models.push(ModelConfig::new(id));
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    StreamableHttp,
+}
+
+impl McpTransport {
+    pub const ALL: [Self; 2] = [Self::Stdio, Self::StreamableHttp];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Stdio => "Local process (stdio)",
+            Self::StreamableHttp => "Streamable HTTP",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub transport: McpTransport,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env_allowlist: Vec<String>,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub bearer_auth: bool,
+    #[serde(default)]
+    pub enabled_tools: Vec<String>,
+}
+
+impl McpServerConfig {
+    pub fn stdio(id: u64, name: impl Into<String>, command: impl Into<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            transport: McpTransport::Stdio,
+            command: command.into(),
+            args: Vec::new(),
+            cwd: None,
+            env_allowlist: Vec::new(),
+            url: String::new(),
+            bearer_auth: false,
+            enabled_tools: Vec::new(),
+        }
+    }
+
+    pub fn http(id: u64, name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            transport: McpTransport::StreamableHttp,
+            command: String::new(),
+            args: Vec::new(),
+            cwd: None,
+            env_allowlist: Vec::new(),
+            url: url.into(),
+            bearer_auth: false,
+            enabled_tools: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Config {
-    pub welcome_message: String,
-    pub provider_base_url: String,
-    pub provider_model: String,
+    #[serde(default = "default_config_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub default_provider_id: Option<u64>,
+    #[serde(default)]
+    pub providers: Vec<ProviderProfile>,
+    #[serde(default)]
+    pub provider_sequence: u64,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+    #[serde(default)]
+    pub mcp_sequence: u64,
+    #[serde(default = "default_true")]
+    pub history_enabled: bool,
+    #[serde(default = "default_retention_days")]
+    pub history_retention_days: u32,
+    #[serde(default = "default_true")]
+    pub save_tool_outputs: bool,
+    #[serde(default)]
+    pub theme: Theme,
+    // Phase 3 compatibility. These keys are read once and never written back.
+    #[serde(default, rename = "provider_base_url", skip_serializing)]
+    pub legacy_provider_base_url: Option<String>,
+    #[serde(default, rename = "provider_model", skip_serializing)]
+    pub legacy_provider_model: Option<String>,
+    #[serde(default, rename = "welcome_message", skip_serializing)]
+    pub legacy_welcome_message: Option<String>,
+}
+
+fn default_config_version() -> u32 {
+    CONFIG_VERSION
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_retention_days() -> u32 {
+    365
 }
 
 impl Default for Config {
     fn default() -> Self {
+        let profile = ProviderProfile::new(
+            1,
+            "Local gateway",
+            Protocol::OpenAiChat,
+            "http://127.0.0.1:3001/v1",
+            AuthMode::None,
+            "auto",
+        );
         Self {
-            welcome_message: "Your local agent workspace is ready to configure.".to_owned(),
-            provider_base_url: "http://127.0.0.1:3001/v1".to_owned(),
-            provider_model: "auto".to_owned(),
+            version: CONFIG_VERSION,
+            default_provider_id: Some(profile.id),
+            provider_sequence: profile.id,
+            providers: vec![profile],
+            mcp_servers: Vec::new(),
+            mcp_sequence: 0,
+            history_enabled: true,
+            history_retention_days: default_retention_days(),
+            save_tool_outputs: true,
+            theme: Theme::System,
+            legacy_provider_base_url: None,
+            legacy_provider_model: None,
+            legacy_welcome_message: None,
         }
     }
 }
@@ -26,10 +373,15 @@ impl Default for Config {
 impl Config {
     pub fn load_or_default(path: &Path) -> Result<Self, AppError> {
         match fs::read_to_string(path) {
-            Ok(contents) => toml::from_str(&contents).map_err(|source| AppError::ConfigParse {
-                path: path.to_owned(),
-                source,
-            }),
+            Ok(contents) => {
+                let mut config: Config =
+                    toml::from_str(&contents).map_err(|source| AppError::ConfigParse {
+                        path: path.to_owned(),
+                        source,
+                    })?;
+                config.normalize();
+                Ok(config)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(source) => Err(AppError::ConfigRead {
                 path: path.to_owned(),
@@ -46,55 +398,459 @@ impl Config {
                 source,
             })?;
         }
-        fs::write(path, contents).map_err(|source| AppError::ConfigWrite {
+        let temporary = path.with_extension("toml.tmp");
+        fs::write(&temporary, contents).map_err(|source| AppError::ConfigWrite {
+            path: temporary.clone(),
+            source,
+        })?;
+        fs::rename(&temporary, path).map_err(|source| AppError::ConfigWrite {
             path: path.to_owned(),
             source,
         })
+    }
+
+    /// Repair imported data and fill defaults without discarding user entries.
+    pub fn normalize(&mut self) {
+        self.version = CONFIG_VERSION;
+        self.history_retention_days = self.history_retention_days.clamp(1, 3_650);
+
+        if self.providers.is_empty()
+            && let Some(base_url) = self.legacy_provider_base_url.take()
+        {
+            let model = self
+                .legacy_provider_model
+                .take()
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or_else(|| "auto".to_owned());
+            self.providers.push(ProviderProfile::new(
+                1,
+                "Imported provider",
+                Protocol::OpenAiChat,
+                base_url,
+                AuthMode::Bearer,
+                model,
+            ));
+        }
+        self.legacy_provider_base_url = None;
+        self.legacy_provider_model = None;
+        self.legacy_welcome_message = None;
+
+        if self.providers.is_empty() {
+            let profile = ProviderProfile::new(
+                1,
+                "Local gateway",
+                Protocol::OpenAiChat,
+                "http://127.0.0.1:3001/v1",
+                AuthMode::None,
+                "auto",
+            );
+            self.providers.push(profile);
+        }
+
+        let mut seen = HashSet::new();
+        let mut next_id = self
+            .providers
+            .iter()
+            .map(|provider| provider.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        for provider in &mut self.providers {
+            while !seen.insert(provider.id) {
+                provider.id = next_id;
+                next_id = next_id.saturating_add(1);
+            }
+            if provider.name.trim().is_empty() {
+                provider.name = format!("Provider {}", provider.id);
+            }
+            provider.name = provider.name.trim().to_owned();
+            provider.base_url = provider.base_url.trim().to_owned();
+            if !provider.protocol.allowed_auth().contains(&provider.auth) {
+                provider.auth = provider.protocol.default_auth();
+            }
+            let mut seen_models = HashSet::new();
+            provider.models.retain(|model| {
+                let id = model.id.trim();
+                !id.is_empty() && seen_models.insert(id.to_owned())
+            });
+            for model in &mut provider.models {
+                model.id = model.id.trim().to_owned();
+                if model.display_name.trim().is_empty() {
+                    model.display_name = model.id.clone();
+                } else {
+                    model.display_name = model.display_name.trim().to_owned();
+                }
+                if let Some(pricing) = &mut model.pricing {
+                    pricing.currency = pricing.currency.trim().to_owned();
+                    if pricing.currency.is_empty() {
+                        pricing.currency = default_currency();
+                    }
+                }
+            }
+            let default_model = provider.default_model.trim().to_owned();
+            if default_model.is_empty() {
+                provider.default_model = provider
+                    .models
+                    .first()
+                    .map(|model| model.id.clone())
+                    .unwrap_or_else(|| "auto".to_owned());
+            } else {
+                provider.default_model = default_model;
+            }
+            provider.ensure_model(&provider.default_model.clone());
+        }
+        self.provider_sequence = self.provider_sequence.max(
+            self.providers
+                .iter()
+                .map(|provider| provider.id)
+                .max()
+                .unwrap_or(0),
+        );
+
+        if self
+            .default_provider_id
+            .is_none_or(|id| !self.providers.iter().any(|provider| provider.id == id))
+        {
+            self.default_provider_id = self.providers.first().map(|provider| provider.id);
+        }
+
+        let mut seen_mcp = HashSet::new();
+        let mut next_mcp_id = self
+            .mcp_servers
+            .iter()
+            .map(|server| server.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        for server in &mut self.mcp_servers {
+            while !seen_mcp.insert(server.id) {
+                server.id = next_mcp_id;
+                next_mcp_id = next_mcp_id.saturating_add(1);
+            }
+            if server.name.trim().is_empty() {
+                server.name = format!("MCP server {}", server.id);
+            }
+            server.name = server.name.trim().to_owned();
+            server.command = server.command.trim().to_owned();
+            server.url = server.url.trim().to_owned();
+            server.cwd = server
+                .cwd
+                .take()
+                .map(|cwd| cwd.trim().to_owned())
+                .filter(|cwd| !cwd.is_empty());
+            server.env_allowlist.retain(|name| !name.trim().is_empty());
+            for name in &mut server.env_allowlist {
+                *name = name.trim().to_owned();
+            }
+            server.enabled_tools.retain(|name| !name.trim().is_empty());
+            for name in &mut server.enabled_tools {
+                *name = name.trim().to_owned();
+            }
+        }
+        self.mcp_sequence = self.mcp_sequence.max(
+            self.mcp_servers
+                .iter()
+                .map(|server| server.id)
+                .max()
+                .unwrap_or(0),
+        );
+    }
+
+    pub fn provider(&self, id: u64) -> Option<&ProviderProfile> {
+        self.providers.iter().find(|provider| provider.id == id)
+    }
+
+    pub fn provider_mut(&mut self, id: u64) -> Option<&mut ProviderProfile> {
+        self.providers.iter_mut().find(|provider| provider.id == id)
+    }
+
+    pub fn default_provider(&self) -> Option<&ProviderProfile> {
+        self.default_provider_id
+            .and_then(|id| self.provider(id))
+            .or_else(|| self.providers.first())
+    }
+
+    pub fn allocate_provider_id(&mut self) -> u64 {
+        self.provider_sequence = self
+            .provider_sequence
+            .max(
+                self.providers
+                    .iter()
+                    .map(|provider| provider.id)
+                    .max()
+                    .unwrap_or(0),
+            )
+            .saturating_add(1);
+        self.provider_sequence
+    }
+
+    pub fn remove_provider(&mut self, id: u64) -> bool {
+        if self.providers.len() <= 1 {
+            return false;
+        }
+        let Some(index) = self.providers.iter().position(|provider| provider.id == id) else {
+            return false;
+        };
+        self.providers.remove(index);
+        if self.default_provider_id == Some(id) {
+            self.default_provider_id = self.providers.first().map(|provider| provider.id);
+        }
+        true
+    }
+
+    pub fn mcp_server(&self, id: u64) -> Option<&McpServerConfig> {
+        self.mcp_servers.iter().find(|server| server.id == id)
+    }
+
+    pub fn allocate_mcp_server_id(&mut self) -> u64 {
+        self.mcp_sequence = self
+            .mcp_sequence
+            .max(
+                self.mcp_servers
+                    .iter()
+                    .map(|server| server.id)
+                    .max()
+                    .unwrap_or(0),
+            )
+            .saturating_add(1);
+        self.mcp_sequence
+    }
+
+    pub fn remove_mcp_server(&mut self, id: u64) -> bool {
+        let Some(index) = self.mcp_servers.iter().position(|server| server.id == id) else {
+            return false;
+        };
+        self.mcp_servers.remove(index);
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::*;
 
     #[test]
-    fn defaults_provide_a_welcome_message() {
-        assert!(!Config::default().welcome_message.is_empty());
+    fn defaults_include_a_local_gateway_provider() {
+        let config = Config::default();
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.default_provider_id, Some(1));
+        assert!(config.history_enabled);
+        assert_eq!(config.providers[0].auth, AuthMode::None);
     }
 
     #[test]
     fn parses_a_toml_override_and_defaults_missing_fields() {
-        let config: Config = toml::from_str("welcome_message = 'Hello, NEXUS'").unwrap();
+        let mut config: Config = toml::from_str("history_enabled = false").unwrap();
+        config.normalize();
 
-        assert_eq!(config.welcome_message, "Hello, NEXUS");
-        assert_eq!(config.provider_model, "auto");
+        assert!(!config.history_enabled);
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.providers[0].default_model, "auto");
     }
 
     #[test]
-    fn missing_config_file_uses_defaults() {
-        let path =
-            std::env::temp_dir().join(format!("nexus-config-{}-missing.toml", std::process::id()));
+    fn imports_the_phase_three_single_provider_fields() {
+        let mut config: Config = toml::from_str(
+            "provider_base_url = 'https://legacy.example/v1'\nprovider_model = 'legacy-model'",
+        )
+        .unwrap();
+        config.normalize();
 
-        let config = Config::load_or_default(&path).unwrap();
-
-        assert_eq!(config, Config::default());
+        let provider = config.default_provider().unwrap();
+        assert_eq!(provider.base_url, "https://legacy.example/v1");
+        assert_eq!(provider.default_model, "legacy-model");
+        assert_eq!(provider.protocol, Protocol::OpenAiChat);
+        assert_eq!(provider.auth, AuthMode::Bearer);
     }
 
     #[test]
-    fn saves_and_loads_a_config_file() {
-        let path = std::env::temp_dir().join(format!(
-            "nexus-config-{}-roundtrip/config.toml",
-            std::process::id()
-        ));
-        let config = Config {
-            welcome_message: "Hello from a saved config".to_owned(),
+    fn imports_phase_four_providers_without_protocol_or_display_names() {
+        let mut config: Config = toml::from_str(
+            "welcome_message = 'hi'\nactive_provider_id = 1\nprovider_sequence = 2\n\
+             [[providers]]\nid = 1\nname = 'Local gateway'\nbase_url = 'http://127.0.0.1:3001/v1'\nmodel = 'auto'\n",
+        )
+        .unwrap();
+        config.normalize();
+
+        let provider = config.default_provider().unwrap();
+        assert_eq!(provider.id, 1);
+        assert_eq!(provider.protocol, Protocol::OpenAiChat);
+        assert_eq!(provider.default_model, "auto");
+        assert!(provider.models.iter().any(|model| model.id == "auto"));
+        assert_eq!(config.default_provider_id, Some(1));
+    }
+
+    #[test]
+    fn explicit_providers_and_active_selection_survive_round_trip() {
+        let mut config = Config {
+            providers: vec![
+                ProviderProfile::new(
+                    3,
+                    "Alpha",
+                    Protocol::AnthropicMessages,
+                    "https://api.anthropic.com/v1",
+                    AuthMode::XApiKey,
+                    "claude-sonnet",
+                ),
+                ProviderProfile::new(
+                    7,
+                    "Beta",
+                    Protocol::OpenAiChat,
+                    "https://beta.example/v1",
+                    AuthMode::Bearer,
+                    "beta",
+                ),
+            ],
+            default_provider_id: Some(7),
             ..Config::default()
         };
+        config.normalize();
+        let path = std::env::temp_dir().join(format!(
+            "nexus-config-{}-providers/config.toml",
+            std::process::id()
+        ));
 
         config.save(&path).unwrap();
         let loaded = Config::load_or_default(&path).unwrap();
 
-        assert_eq!(loaded, config);
+        assert_eq!(loaded.providers, config.providers);
+        assert_eq!(loaded.default_provider_id, Some(7));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn invalid_active_provider_falls_back_to_the_first_entry() {
+        let mut config = Config {
+            providers: vec![ProviderProfile::new(
+                9,
+                "Only",
+                Protocol::OllamaChat,
+                "http://127.0.0.1:11434",
+                AuthMode::None,
+                "llama3.2",
+            )],
+            default_provider_id: Some(77),
+            ..Config::default()
+        };
+        config.normalize();
+
+        assert_eq!(config.default_provider_id, Some(9));
+    }
+
+    #[test]
+    fn removing_the_default_provider_selects_another_and_keeps_one() {
+        let mut config = Config {
+            providers: vec![
+                ProviderProfile::new(
+                    1,
+                    "One",
+                    Protocol::OpenAiChat,
+                    "https://one.example/v1",
+                    AuthMode::Bearer,
+                    "one",
+                ),
+                ProviderProfile::new(
+                    2,
+                    "Two",
+                    Protocol::OpenAiChat,
+                    "https://two.example/v1",
+                    AuthMode::Bearer,
+                    "two",
+                ),
+            ],
+            default_provider_id: Some(1),
+            ..Config::default()
+        };
+        config.normalize();
+
+        assert!(config.remove_provider(1));
+        assert_eq!(config.default_provider_id, Some(2));
+        assert!(!config.remove_provider(2));
+    }
+
+    #[test]
+    fn removed_provider_ids_are_not_reused() {
+        let mut config = Config::default();
+        let second = config.allocate_provider_id();
+        assert_eq!(second, 2);
+        config.providers.push(ProviderProfile::new(
+            second,
+            "Second",
+            Protocol::OpenAiChat,
+            "https://second.example/v1",
+            AuthMode::Bearer,
+            "second",
+        ));
+        assert!(config.remove_provider(second));
+        assert_eq!(config.allocate_provider_id(), 3);
+    }
+
+    #[test]
+    fn duplicate_ids_are_repaired_without_losing_entries() {
+        let mut config = Config {
+            providers: vec![
+                ProviderProfile::new(
+                    1,
+                    "One",
+                    Protocol::OpenAiChat,
+                    "https://one.example/v1",
+                    AuthMode::Bearer,
+                    "one",
+                ),
+                ProviderProfile::new(
+                    1,
+                    "Two",
+                    Protocol::OpenAiChat,
+                    "https://two.example/v1",
+                    AuthMode::Bearer,
+                    "two",
+                ),
+            ],
+            default_provider_id: Some(1),
+            ..Config::default()
+        };
+        config.normalize();
+
+        assert_eq!(config.providers.len(), 2);
+        assert_eq!(config.providers[0].id, 1);
+        assert_eq!(config.providers[1].id, 2);
+    }
+
+    #[test]
+    fn invalid_auth_is_replaced_with_the_protocol_default() {
+        let mut config = Config {
+            providers: vec![ProviderProfile {
+                id: 1,
+                name: "Anthropic".into(),
+                protocol: Protocol::AnthropicMessages,
+                base_url: "https://api.anthropic.com/v1".into(),
+                auth: AuthMode::None,
+                default_model: "claude".into(),
+                models: vec![ModelConfig::new("claude")],
+            }],
+            ..Config::default()
+        };
+        config.normalize();
+        assert_eq!(config.providers[0].auth, AuthMode::XApiKey);
+    }
+
+    #[test]
+    fn mcp_servers_round_trip_and_ids_are_allocated_once() {
+        let mut config = Config::default();
+        let id = config.allocate_mcp_server_id();
+        config
+            .mcp_servers
+            .push(McpServerConfig::stdio(id, "Files", "npx"));
+        let path = std::env::temp_dir().join(format!(
+            "nexus-config-{}-mcp/config.toml",
+            std::process::id()
+        ));
+        config.save(&path).unwrap();
+        let mut loaded = Config::load_or_default(&path).unwrap();
+        assert_eq!(loaded.mcp_servers.len(), 1);
+        assert_eq!(loaded.allocate_mcp_server_id(), id + 1);
+        assert!(loaded.remove_mcp_server(id));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
