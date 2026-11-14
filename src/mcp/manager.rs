@@ -567,6 +567,10 @@ fn unix_now() -> u64 {
 }
 
 #[cfg(test)]
+#[path = "fixture_json.rs"]
+mod fixture_json;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -606,6 +610,47 @@ mod tests {
     }
 
     #[test]
+    fn fixture_json_finds_top_level_fields_in_any_order_with_whitespace() {
+        use super::fixture_json::{object_field, string_value};
+
+        let message = r#"{ "params" : { "nested" : { "id" : 99 }, "protocolVersion" : "2026-07-28" }, "method" : "initialize", "id" : 42 }"#;
+        assert_eq!(object_field(message, "id"), Some("42"));
+        assert_eq!(object_field(message, "method"), Some("\"initialize\""));
+        assert_eq!(
+            object_field(message, "method")
+                .and_then(string_value)
+                .as_deref(),
+            Some("initialize")
+        );
+        let params = object_field(message, "params").unwrap();
+        assert_eq!(
+            object_field(params, "protocolVersion"),
+            Some("\"2026-07-28\"")
+        );
+        assert_eq!(object_field(params, "id"), None);
+        assert_eq!(
+            object_field(r#"{"params":{"method":"fake","id":1}}"#, "method"),
+            None
+        );
+    }
+
+    #[test]
+    fn fixture_json_preserves_ids_and_handles_escaped_strings() {
+        use super::fixture_json::{object_field, string_value};
+
+        for (message, expected) in [
+            (r#"{"id":7}"#, "7"),
+            (r#"{"id":"req-7"}"#, r#""req-7""#),
+            (r#"{"id":-12.50e+2}"#, "-12.50e+2"),
+            (r#"{"method":"ping","id":"a\"b"}"#, r#""a\"b""#),
+        ] {
+            assert_eq!(object_field(message, "id"), Some(expected));
+        }
+        assert_eq!(string_value(r#""a\"b""#).as_deref(), Some("a\"b"));
+        assert_eq!(string_value("  \"ping\" \n").as_deref(), Some("ping"));
+    }
+
+    #[test]
     fn spawn_failure_becomes_a_terminal_error_without_raw_details() {
         let mut manager = McpManager::new();
         let settings = server(McpTransport::Stdio);
@@ -626,7 +671,9 @@ mod tests {
     fn mock_server_binary() -> &'static str {
         static BINARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         BINARY.get_or_init(|| {
-            let source = r#"
+            let source = concat!(
+                include_str!("fixture_json.rs"),
+                r##"
 use std::io::{BufRead, Write};
 
 fn main() {
@@ -639,58 +686,41 @@ fn main() {
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
-        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-        let method = message.get("method").and_then(|value| value.as_str()).unwrap_or("");
+        let method = object_field(&line, "method")
+            .and_then(string_value)
+            .unwrap_or_default();
         if let Some(path) = &log {
             let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
             writeln!(file, "{method}").unwrap();
         }
-        let Some(id) = message.get("id").cloned() else { continue };
-        let result = match method {
+        let Some(id) = object_field(&line, "id") else { continue };
+        let result = match method.as_str() {
             "initialize" => {
-                let version = message["params"]["protocolVersion"].clone();
-                serde_json::json!({
-                    "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": "Mock MCP", "version": "1.0.0"},
-                    "instructions": "Read-only fixture"
-                })
+                let version = object_field(&line, "params")
+                    .and_then(|params| object_field(params, "protocolVersion"))
+                    .unwrap_or("\"2026-07-28\"");
+                format!(
+                    "{{\"protocolVersion\":{version},\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"Mock MCP\",\"version\":\"1.0.0\"}},\"instructions\":\"Read-only fixture\"}}"
+                )
             }
-            "ping" => serde_json::json!({}),
-            "tools/list" => serde_json::json!({
-                "tools": [
-                    {
-                        "name": "echo",
-                        "description": "Returns its input",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {"text": {"type": "string"}},
-                            "required": ["text"]
-                        }
-                    },
-                    {
-                        "name": "noop",
-                        "inputSchema": {"type": "object"}
-                    }
-                ]
-            }),
+            "ping" => "{}".to_owned(),
+            "tools/list" => r#"{"tools":[{"name":"echo","description":"Returns its input","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},{"name":"noop","inputSchema":{"type":"object"}}]}"#.to_owned(),
             _ => {
-                let response = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {"code": -32601, "message": "not supported by fixture"}
-                });
+                let response = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32601,\"message\":\"not supported by fixture\"}}}}"
+                );
                 writeln!(stdout, "{response}").unwrap();
                 stdout.flush().unwrap();
                 continue;
             }
         };
-        let response = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+        let response = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}");
         writeln!(stdout, "{response}").unwrap();
         stdout.flush().unwrap();
     }
 }
-"#;
+"##
+            );
             let dir = std::env::temp_dir().join(format!(
                 "nexus-mcp-fixture-{}",
                 std::process::id()
@@ -699,41 +729,8 @@ fn main() {
             let source_path = dir.join("mock.rs");
             let binary_path = dir.join("mock-server");
             std::fs::write(&source_path, source).unwrap();
-            let executable = std::env::current_exe()
-                .expect("the test executable path must be available for the MCP fixture");
-            let deps = executable
-                .parent()
-                .expect("the test executable must have a parent directory")
-                .to_path_buf();
-            let serde_json = std::fs::read_dir(&deps)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "cannot read Cargo dependency directory {}: {error}",
-                        deps.display()
-                    )
-                })
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| {
-                            name.starts_with("libserde_json-") && name.ends_with(".rlib")
-                        })
-                })
-                .max_by_key(|path| path.metadata().and_then(|meta| meta.modified()).ok())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "serde_json rlib must exist in Cargo dependency directory {}",
-                        deps.display()
-                    )
-                });
             let status = std::process::Command::new("rustc")
                 .arg("--edition=2021")
-                .arg("-L")
-                .arg(format!("dependency={}", deps.display()))
-                .arg("--extern")
-                .arg(format!("serde_json={}", serde_json.display()))
                 .arg("-o")
                 .arg(&binary_path)
                 .arg(&source_path)
