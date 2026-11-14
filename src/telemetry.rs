@@ -194,6 +194,20 @@ fn mark_unavailable(state: &Mutex<TelemetrySnapshot>, started_at: Instant, reaso
 }
 
 #[cfg(test)]
+impl TelemetryService {
+    /// A service that never spawns a sampling thread, for headless UI tests.
+    pub(crate) fn inert() -> Self {
+        let (stop, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        Self {
+            state: Arc::new(Mutex::new(TelemetrySnapshot::new(std::process::id()))),
+            stop,
+            worker: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         CollectionStatus, HISTORY_CAPACITY, ResourceSample, TelemetryService, TelemetrySnapshot,

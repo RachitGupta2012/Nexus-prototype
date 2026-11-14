@@ -45,8 +45,12 @@
 ## Explicit provider requests
 
 - Phase 3's local recommendation engine remains pure and offline. A separate provider request is made only after the user presses **Send task to provider**.
-- The initial connector supports OpenAI-compatible Chat Completions only. It does not imply support for every API provider or distinct API protocol.
+- Supported inference protocols are OpenAI-compatible Chat Completions, the native OpenAI Responses API, native Ollama chat, the native Anthropic Messages API, and native Gemini Generate Content. No protocol is implied to work merely because it can be configured.
+- Anthropic requests send the Keychain-backed key only in the `x-api-key` header plus the required `anthropic-version` header. No `Authorization` header is sent, no version is guessed, and no tool or agent execution is supported. HTTP error bodies are not read or displayed.
+- OpenAI Responses requests send the Keychain-backed key only in the `Authorization: Bearer` header, set `store: false` so NEXUS does not request provider-side response retention, and never execute returned tool calls. Non-text output items fail with a sanitized unsupported-operation error rather than being discarded. Response bodies and error text are not displayed.
+- Gemini requests send the Keychain-backed key only in the `x-goog-api-key` header. Only the configured base URL and model-list/generation paths are contacted; request and response bodies are bounded, redirects are disabled, and safety or finish-reason text from the provider is mapped to fixed local messages rather than echoed.
 - The user supplies the API key. NEXUS does not search for keys, import environment variables, inspect provider configuration, or query Keychain until an explicit send. Saving and removing a key are separate user actions; macOS keys are stored in Keychain under the configured endpoint origin, never in the NEXUS config or logs. Changing to a different host does not reuse the previous host's key.
+- Connectivity probes ("Test connection") and model discovery send one model-list request to the configured endpoint with an 8-second timeout and no redirects. They never generate tokens, never install models, and never contact any other host. Probe results distinguish reachability, authentication, and model-list parsing; they are not capability evidence or execution permission.
 - Remote provider requests send the task text and model identifier to the configured endpoint and may incur charges. The UI explains this before the send action. A user-configured remote endpoint must use HTTPS; plain HTTP is accepted only for loopback addresses. Embedded credentials, query strings, fragments, and redirects are rejected/disabled.
 - Requests run on one short-lived standard-library worker thread with a 120-second total timeout and bounded response body. No polling, background service, telemetry, or automatic requests are added.
 - The connector returns text only. It does not execute agents, edit project files, or grant execution authorization. A future agent/workspace operation requires separate explicit authorization for that specific task, agent, workspace, and operations.
@@ -72,3 +76,10 @@ An explicit discovery scan checks only the exact `DeepAI Code.app` and `OpenCode
 - Search reads saved conversations only; it cannot surface memory-only conversations and is bounded to 200 results.
 - Clearing history deletes conversations, messages, and conversation-linked usage. It does not delete provider profiles, Keychain credentials, application settings, or the configuration file.
 - Theme, retention, and history preferences are stored in the TOML configuration; provider keys never are. Data-location copy buttons expose paths only, never credential contents.
+
+## Configuration recovery
+
+- When `config.toml` cannot be read or parsed, NEXUS never replaces it silently and never exits with the parser's raw message, which can quote file content.
+- The recovery window shows the file path and a normalized description: parse line and column, or a read-error category. It never displays, logs, or copies file contents.
+- Reset is two-step and copies the original file to a sibling `.corrupt-<timestamp>` backup before writing defaults. If the backup fails, nothing is written.
+- Recovery never reads, writes, or deletes Keychain entries, provider profiles stored elsewhere, the database, or conversations.

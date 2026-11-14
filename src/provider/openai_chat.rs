@@ -6,8 +6,8 @@ use tokio::sync::watch;
 
 use super::http::{self, SseEvent};
 use super::{
-    ChatEvent, ChatRequest, MAX_TOOL_CALLS, MAX_TOOL_DEFINITION_BYTES, MAX_TOOL_DESCRIPTION_BYTES,
-    ProviderError, ProviderSettings, send_event,
+    ChatEvent, ChatRequest, FinishReason, MAX_TOOL_CALLS, MAX_TOOL_DEFINITION_BYTES,
+    MAX_TOOL_DESCRIPTION_BYTES, ProviderError, ProviderSettings, send_event,
 };
 use crate::chat::{
     MAX_ASSISTANT_MESSAGE_BYTES, MAX_TOOL_ARGUMENT_BYTES, MessageRole, StoredMessage, TokenUsage,
@@ -310,6 +310,7 @@ impl<'a> StreamState<'a> {
             ChatEvent::Finished {
                 tool_calls,
                 usage: self.usage.clone(),
+                finish: FinishReason::Completed,
             },
         )
     }
@@ -470,7 +471,10 @@ mod tests {
 
         let events: Vec<_> = receiver.try_iter().collect();
         assert!(matches!(&events[0], ChatEvent::TextDelta(text) if text == "Hello "));
-        let ChatEvent::Finished { tool_calls, usage } = &events[1] else {
+        let ChatEvent::Finished {
+            tool_calls, usage, ..
+        } = &events[1]
+        else {
             panic!("expected finished event");
         };
         assert_eq!(tool_calls[0].name, "files__read");

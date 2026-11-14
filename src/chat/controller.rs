@@ -13,7 +13,7 @@ use crate::chat::{
 use crate::config::Config;
 use crate::credentials;
 use crate::provider::{
-    ChatEvent, ChatRequest, ProviderController, ProviderError, ProviderSettings,
+    ChatEvent, ChatRequest, FinishReason, ProviderController, ProviderError, ProviderSettings,
 };
 use crate::storage::{ConversationUsage, NewMessage, Storage, StorageError, unix_time_now};
 
@@ -363,15 +363,19 @@ impl ChatController {
     }
 
     pub fn poll(&mut self, config: &Config, storage: &Storage) {
-        let mut finished: Option<(Vec<ToolCall>, Option<TokenUsage>)> = None;
+        let mut finished: Option<(Vec<ToolCall>, Option<TokenUsage>, FinishReason)> = None;
         let mut failed: Option<ProviderError> = None;
         if let Some(stream) = self.streaming.as_mut() {
             for event in stream.controller.poll() {
                 match event {
                     ChatEvent::TextDelta(delta) => stream.text.push_str(&delta),
                     ChatEvent::ReasoningDelta(delta) => stream.reasoning.push_str(&delta),
-                    ChatEvent::Finished { tool_calls, usage } => {
-                        finished = Some((tool_calls, usage));
+                    ChatEvent::Finished {
+                        tool_calls,
+                        usage,
+                        finish,
+                    } => {
+                        finished = Some((tool_calls, usage, finish));
                         break;
                     }
                     ChatEvent::Failed(error) => {
@@ -381,8 +385,8 @@ impl ChatController {
                 }
             }
         }
-        if let Some((tool_calls, usage)) = finished {
-            self.finish(config, storage, tool_calls, usage);
+        if let Some((tool_calls, usage, finish)) = finished {
+            self.settle(config, storage, tool_calls, usage, finish);
         } else if let Some(error) = failed {
             self.fail(storage, &error.to_string());
         }
@@ -468,6 +472,42 @@ impl ChatController {
             }
             Ok(None) => {}
             Err(error) => self.error = Some(error),
+        }
+    }
+
+    /// Applies a terminal stream outcome. Partial text is persisted in every
+    /// case; blocked, recitation, and incomplete endings are never reported as
+    /// ordinary successful answers.
+    fn settle(
+        &mut self,
+        config: &Config,
+        storage: &Storage,
+        tool_calls: Vec<ToolCall>,
+        usage: Option<TokenUsage>,
+        finish: FinishReason,
+    ) {
+        match finish {
+            FinishReason::Completed => self.finish(config, storage, tool_calls, usage),
+            FinishReason::MaxTokens => {
+                self.finish(config, storage, tool_calls, usage);
+                if self.error.is_none() {
+                    self.notice = Some(
+                        "The response reached the model's output-token limit and may be incomplete."
+                            .to_owned(),
+                    );
+                }
+            }
+            FinishReason::Blocked => {
+                self.fail(storage, "The provider blocked or refused this response.")
+            }
+            FinishReason::Recitation => self.fail(
+                storage,
+                "The provider stopped this response because it may reproduce protected content.",
+            ),
+            FinishReason::Incomplete => self.fail(
+                storage,
+                "The provider ended the response before it completed.",
+            ),
         }
     }
 
@@ -673,6 +713,51 @@ mod tests {
             providers: vec![provider],
             default_provider_id: Some(1),
             ..Config::default()
+        }
+    }
+
+    fn streaming_from_text(text: &str) -> StreamingReply {
+        StreamingReply {
+            controller: ProviderController::test_inert(),
+            text: text.to_owned(),
+            reasoning: String::new(),
+            started_at: Instant::now(),
+            target: ChatTarget::new(1, "test-model"),
+        }
+    }
+
+    #[test]
+    fn max_token_termination_is_surfaced_as_a_notice() {
+        let storage = Storage::open_in_memory().unwrap();
+        let config = config_with_pricing();
+        let mut controller = ChatController::new();
+        controller.streaming = Some(streaming_from_text("partial answer"));
+        controller.settle(&config, &storage, Vec::new(), None, FinishReason::MaxTokens);
+        assert!(controller.streaming.is_none());
+        assert!(controller.error.is_none());
+        assert!(
+            controller
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("output-token limit"))
+        );
+    }
+
+    #[test]
+    fn blocked_and_incomplete_outcomes_are_not_reported_as_success() {
+        for (finish, expected) in [
+            (FinishReason::Blocked, "blocked"),
+            (FinishReason::Recitation, "protected content"),
+            (FinishReason::Incomplete, "before it completed"),
+        ] {
+            let storage = Storage::open_in_memory().unwrap();
+            let config = config_with_pricing();
+            let mut controller = ChatController::new();
+            controller.streaming = Some(streaming_from_text("partial"));
+            controller.settle(&config, &storage, Vec::new(), None, finish);
+            assert!(controller.streaming.is_none());
+            let error = controller.error.expect("error");
+            assert!(error.contains(expected), "{finish:?} gave {error:?}");
         }
     }
 

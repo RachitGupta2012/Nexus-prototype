@@ -1,8 +1,13 @@
 //! Direct model-provider clients. Every protocol is an explicit adapter over
 //! documented HTTP APIs. No agent process is launched from this layer.
 
+pub mod anthropic_messages;
+pub mod gemini_generate_content;
 mod http;
+pub mod ollama_chat;
 pub mod openai_chat;
+pub mod openai_responses;
+pub mod probe;
 
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
@@ -37,11 +42,9 @@ pub struct ProviderSettings {
 }
 
 impl ProviderSettings {
-    pub fn validate(&self) -> Result<Url, ProviderError> {
-        let model = self.model.trim();
-        if model.is_empty() || model.len() > MAX_MODEL_BYTES {
-            return Err(ProviderError::InvalidModel);
-        }
+    /// Validates the endpoint and authentication mode only. Connectivity and
+    /// model listing do not need a chosen model name.
+    pub fn validate_endpoint(&self) -> Result<Url, ProviderError> {
         if self.base_url.len() > MAX_BASE_URL_BYTES {
             return Err(ProviderError::InvalidBaseUrl);
         }
@@ -71,13 +74,35 @@ impl ProviderSettings {
         Ok(url)
     }
 
+    pub fn validate(&self) -> Result<Url, ProviderError> {
+        let model = self.model.trim();
+        if model.is_empty() || model.len() > MAX_MODEL_BYTES {
+            return Err(ProviderError::InvalidModel);
+        }
+        self.validate_endpoint()
+    }
+
     pub fn endpoint(&self) -> Result<Url, ProviderError> {
         let base = self.validate()?;
         let path = match self.protocol {
             Protocol::OpenAiChat => "/chat/completions",
             Protocol::OpenAiResponses => "/responses",
             Protocol::AnthropicMessages => "/messages",
-            Protocol::GeminiGenerateContent => return Ok(base),
+            Protocol::GeminiGenerateContent => {
+                let model = self
+                    .model
+                    .trim()
+                    .strip_prefix("models/")
+                    .unwrap_or(self.model.trim());
+                if model.is_empty()
+                    || !model
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                {
+                    return Err(ProviderError::InvalidModel);
+                }
+                return join_path(base, &format!("/models/{model}:streamGenerateContent"));
+            }
             Protocol::OllamaChat => "/api/chat",
         };
         join_path(base, path)
@@ -116,8 +141,24 @@ pub enum ChatEvent {
     Finished {
         tool_calls: Vec<ToolCall>,
         usage: Option<TokenUsage>,
+        finish: FinishReason,
     },
     Failed(ProviderError),
+}
+
+/// Why a provider stream ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinishReason {
+    /// The model finished the answer normally.
+    Completed,
+    /// The model hit its output-token limit; the text may be incomplete.
+    MaxTokens,
+    /// The provider blocked the response, usually for safety or policy reasons.
+    Blocked,
+    /// The response stopped because it may reproduce protected content.
+    Recitation,
+    /// The stream ended without a documented normal finish signal.
+    Incomplete,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -132,10 +173,22 @@ pub enum ProviderError {
     MissingKey,
     #[error("this provider protocol is not implemented in this build")]
     UnsupportedProtocol,
+    #[error("this response used an unsupported provider feature: {0}")]
+    UnsupportedOperation(&'static str),
     #[error("provider request failed; check the endpoint, network, and credentials")]
     RequestFailed,
     #[error("provider returned HTTP {0}")]
     HttpStatus(u16),
+    #[error("the provider does not have this model available")]
+    ModelNotFound,
+    #[error("the provider rejected the stored API key")]
+    AuthenticationRejected,
+    #[error("the provider denied access; check the API key permissions")]
+    PermissionDenied,
+    #[error("the provider rejected the request as invalid")]
+    InvalidRequest,
+    #[error("the provider rate limit was reached; retry later")]
+    RateLimited,
     #[error("provider response was too large")]
     ResponseTooLarge,
     #[error("provider returned an unsupported response")]
@@ -152,6 +205,15 @@ pub struct ProviderController {
 }
 
 impl ProviderController {
+    /// Builds a controller with no live worker for controller-level tests.
+    #[cfg(test)]
+    pub(crate) fn test_inert() -> Self {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(sender);
+        let (cancel, _receiver) = watch::channel(false);
+        Self { receiver, cancel }
+    }
+
     pub fn start(
         settings: ProviderSettings,
         api_key: Option<String>,
@@ -161,7 +223,14 @@ impl ProviderController {
         if settings.requires_key() && api_key.as_deref().map(str::trim).is_none_or(str::is_empty) {
             return Err(ProviderError::MissingKey);
         }
-        if settings.protocol != Protocol::OpenAiChat {
+        if !matches!(
+            settings.protocol,
+            Protocol::OpenAiChat
+                | Protocol::OpenAiResponses
+                | Protocol::OllamaChat
+                | Protocol::AnthropicMessages
+                | Protocol::GeminiGenerateContent
+        ) {
             return Err(ProviderError::UnsupportedProtocol);
         }
 
@@ -180,13 +249,60 @@ impl ProviderController {
                         return;
                     }
                 };
-                let result = runtime.block_on(openai_chat::stream(
-                    &settings,
-                    api_key.as_deref(),
-                    &request,
-                    &sender,
-                    cancel_receiver,
-                ));
+                let result = runtime.block_on(async {
+                    match settings.protocol {
+                        Protocol::OpenAiChat => {
+                            openai_chat::stream(
+                                &settings,
+                                api_key.as_deref(),
+                                &request,
+                                &sender,
+                                cancel_receiver,
+                            )
+                            .await
+                        }
+                        Protocol::OllamaChat => {
+                            ollama_chat::stream(
+                                &settings,
+                                api_key.as_deref(),
+                                &request,
+                                &sender,
+                                cancel_receiver,
+                            )
+                            .await
+                        }
+                        Protocol::AnthropicMessages => {
+                            anthropic_messages::stream(
+                                &settings,
+                                api_key.as_deref(),
+                                &request,
+                                &sender,
+                                cancel_receiver,
+                            )
+                            .await
+                        }
+                        Protocol::GeminiGenerateContent => {
+                            gemini_generate_content::stream(
+                                &settings,
+                                api_key.as_deref(),
+                                &request,
+                                &sender,
+                                cancel_receiver,
+                            )
+                            .await
+                        }
+                        Protocol::OpenAiResponses => {
+                            openai_responses::stream(
+                                &settings,
+                                api_key.as_deref(),
+                                &request,
+                                &sender,
+                                cancel_receiver,
+                            )
+                            .await
+                        }
+                    }
+                });
                 if let Err(error) = result {
                     let _ = sender.send(ChatEvent::Failed(error));
                 }
@@ -226,6 +342,19 @@ pub(crate) fn join_path(mut base: Url, suffix: &str) -> Result<Url, ProviderErro
     };
     base.set_path(&path);
     Ok(base)
+}
+
+/// Maps HTTP statuses to sanitized provider errors. Response bodies are never
+/// inspected or echoed.
+pub(crate) fn status_error(status: u16) -> ProviderError {
+    match status {
+        400 | 413 | 422 => ProviderError::InvalidRequest,
+        401 => ProviderError::AuthenticationRejected,
+        403 => ProviderError::PermissionDenied,
+        404 => ProviderError::ModelNotFound,
+        429 => ProviderError::RateLimited,
+        other => ProviderError::HttpStatus(other),
+    }
 }
 
 pub(crate) fn is_loopback(url: &Url) -> bool {

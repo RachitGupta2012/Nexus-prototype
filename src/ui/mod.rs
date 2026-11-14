@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
@@ -7,16 +7,33 @@ use crate::error::AppError;
 use crate::storage::{DEFAULT_MAX_CONVERSATIONS, Storage};
 
 mod chat;
+mod mcp;
 mod providers;
+mod recovery;
 mod settings;
+#[cfg(test)]
+mod tests;
 mod usage;
 
-pub fn run(
-    config: Config,
-    config_path: PathBuf,
-    database_path: PathBuf,
-    storage: Storage,
-) -> Result<(), AppError> {
+/// What the process should start as. A configuration that cannot be read or
+/// parsed becomes a recoverable screen instead of a process exit.
+pub enum Start {
+    Ready(Config, Storage),
+    Recover(AppError),
+}
+
+pub fn load_start(config_path: &Path, database_path: &Path) -> Result<Start, AppError> {
+    match Config::load_or_default(config_path) {
+        Ok(config) => Ok(Start::Ready(config, Storage::open(database_path)?)),
+        Err(error @ (AppError::ConfigParse { .. } | AppError::ConfigRead { .. })) => {
+            Ok(Start::Recover(error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn run(config_path: PathBuf, database_path: PathBuf) -> Result<(), AppError> {
+    let start = load_start(&config_path, &database_path)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("NEXUS")
@@ -29,16 +46,96 @@ pub fn run(
         "NEXUS",
         options,
         Box::new(move |_creation_context| {
-            Ok(Box::new(NexusApp::new(
-                config,
-                config_path,
-                database_path,
-                storage,
-            )))
+            Ok(Box::new(RootApp::new(start, config_path, database_path)))
         }),
     )?;
 
     Ok(())
+}
+
+/// Owns either the workbench or the configuration recovery screen and switches
+/// between them in place, so recovery never needs a second event loop.
+struct RootApp {
+    config_path: PathBuf,
+    database_path: PathBuf,
+    ready: Option<Box<NexusApp>>,
+    recovering: Option<recovery::RecoveryScreen>,
+}
+
+impl RootApp {
+    fn new(start: Start, config_path: PathBuf, database_path: PathBuf) -> Self {
+        let mut app = Self {
+            config_path,
+            database_path,
+            ready: None,
+            recovering: None,
+        };
+        match start {
+            Start::Ready(config, storage) => {
+                app.ready = Some(Box::new(NexusApp::new(
+                    config,
+                    app.config_path.clone(),
+                    app.database_path.clone(),
+                    storage,
+                )));
+            }
+            Start::Recover(error) => {
+                app.recovering = Some(recovery::RecoveryScreen::from_error(
+                    app.config_path.clone(),
+                    &error,
+                ));
+            }
+        }
+        app
+    }
+
+    fn enter_workbench(&mut self, config: Config) -> Result<(), String> {
+        match Storage::open(&self.database_path) {
+            Ok(storage) => {
+                self.ready = Some(Box::new(NexusApp::new(
+                    config,
+                    self.config_path.clone(),
+                    self.database_path.clone(),
+                    storage,
+                )));
+                self.recovering = None;
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "The configuration is readable, but the local database could not be opened ({error})."
+            )),
+        }
+    }
+}
+
+impl eframe::App for RootApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some(app) = &mut self.ready {
+            app.show(ui);
+            return;
+        }
+        let Some(screen) = &mut self.recovering else {
+            return;
+        };
+        let outcome = screen.show(ui);
+        match outcome {
+            recovery::RecoveryOutcome::None => {}
+            recovery::RecoveryOutcome::Quit => {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            recovery::RecoveryOutcome::Recovered(config) => {
+                match self.enter_workbench(config) {
+                    Ok(()) => {}
+                    Err(message) => {
+                        // The borrow of `screen` ends before this call.
+                        if let Some(screen) = &mut self.recovering {
+                            screen.runtime_error(message);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct NexusApp {
@@ -50,6 +147,7 @@ struct NexusApp {
     status: Option<String>,
     chat: chat::ChatScreen,
     providers: providers::ProvidersScreen,
+    mcp: mcp::McpScreen,
     settings: settings::SettingsScreen,
     usage: usage::UsageScreen,
     last_title: String,
@@ -74,6 +172,7 @@ impl NexusApp {
         let _ = storage.prune(config.history_retention_days, DEFAULT_MAX_CONVERSATIONS);
         let chat = chat::ChatScreen::new(&config, &storage);
         let providers = providers::ProvidersScreen::new(&config);
+        let mcp = mcp::McpScreen::new(&config);
         Self {
             config,
             config_path,
@@ -83,11 +182,42 @@ impl NexusApp {
             status: None,
             chat,
             providers,
+            mcp,
             settings: settings::SettingsScreen::new(),
             usage: usage::UsageScreen::new(),
             last_title: "NEXUS".to_owned(),
             #[cfg(feature = "telemetry")]
             telemetry: crate::telemetry::TelemetryService::start(),
+        }
+    }
+
+    #[cfg(test)]
+    fn headless(
+        config: Config,
+        config_path: PathBuf,
+        database_path: PathBuf,
+        storage: Storage,
+    ) -> Self {
+        storage.set_history_writes(config.history_enabled);
+        storage.set_tool_output_writes(config.save_tool_outputs);
+        let chat = chat::ChatScreen::new(&config, &storage);
+        let providers = providers::ProvidersScreen::new(&config);
+        let mcp = mcp::McpScreen::new(&config);
+        Self {
+            config,
+            config_path,
+            database_path,
+            storage,
+            selected_section: Section::Chat,
+            status: None,
+            chat,
+            providers,
+            mcp,
+            settings: settings::SettingsScreen::new(),
+            usage: usage::UsageScreen::new(),
+            last_title: "NEXUS".to_owned(),
+            #[cfg(feature = "telemetry")]
+            telemetry: crate::telemetry::TelemetryService::inert(),
         }
     }
 
@@ -110,8 +240,8 @@ impl NexusApp {
     }
 }
 
-impl eframe::App for NexusApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl NexusApp {
+    fn show(&mut self, ui: &mut egui::Ui) {
         settings::apply_config_theme(ui.ctx(), &self.config);
         self.storage.set_history_writes(self.config.history_enabled);
         self.storage
@@ -185,42 +315,34 @@ impl eframe::App for NexusApp {
                     }
                 });
             }
-            Section::Mcp | Section::Resources => {
+            Section::Mcp => {
                 egui::CentralPanel::default().show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.add_space(12.0);
-                            match self.selected_section {
-                                Section::Mcp => show_mcp_placeholder(ui),
-                                Section::Resources => {
-                                    #[cfg(feature = "telemetry")]
-                                    show_resources(ui, &self.telemetry);
-                                    #[cfg(not(feature = "telemetry"))]
-                                    {
-                                        ui.heading("Resources");
-                                        ui.label("Telemetry is disabled in this build.");
-                                    }
-                                }
-                                _ => {}
+                            self.mcp.show(ui, &mut self.config, &self.config_path);
+                        });
+                });
+            }
+            Section::Resources => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add_space(12.0);
+                            #[cfg(feature = "telemetry")]
+                            show_resources(ui, &self.telemetry);
+                            #[cfg(not(feature = "telemetry"))]
+                            {
+                                ui.heading("Resources");
+                                ui.label("Telemetry is disabled in this build.");
                             }
                         });
                 });
             }
         }
         self.update_window_title(ui.ctx());
-    }
-}
-
-fn show_mcp_placeholder(ui: &mut egui::Ui) {
-    ui.heading("MCP");
-    ui.label("MCP client connections will appear here. No server is started automatically.");
-    if ui
-        .small_button("Learn about the planned MCP boundary")
-        .clicked()
-    {
-        ui.ctx()
-            .open_url(egui::OpenUrl::new_tab("https://modelcontextprotocol.io"));
     }
 }
 

@@ -83,6 +83,28 @@ Application bundles have a separate typed detection record rather than being rep
 Non-secret endpoint and model settings live in `config.toml`. On macOS, a user-entered provider key is stored through the OS Keychain and is not serialized or logged. Keychain reads happen only on the worker spawned by an explicit **Send task to provider** action. That operation sends the user's task description to the configured endpoint and displays a text response. It never launches a discovered agent, changes files, or authorizes execution. Requests use HTTPS for remote endpoints, allow plain HTTP only for loopback, do not follow redirects, have a total timeout, and cap the response body. The UI thread remains responsive while the bounded request is in flight.
 
 
+## Phase 5 mission persistence foundation
+
+`src/mission.rs` defines the durable mission model: missions, ordered tasks, task attempts, checkpoints, and approval requests. Each status has an explicit string encoding and a closed transition table, so persistence rejects illegal jumps such as `completed → running` instead of letting a future engine corrupt history.
+
+SQLite schema version 2 adds `missions`, `mission_tasks`, `task_attempts`, `checkpoints`, and `approvals`. The upgrade is additive: a version-1 database keeps its conversations and receives only the new tables. Foreign keys cascade from a mission to tasks, attempts, checkpoints, and approvals; a deleted task nulls checkpoint/approval task references so the mission-level record survives.
+
+All mission writes pass through the history-write gate. With history disabled, creating or mutating missions fails while reads and deletion remain available, matching the conversation boundary. Clearing history deletes missions as well as conversations.
+
+Inputs are bounded before storage: 200-byte titles, 16 KiB objectives, 4 KiB workspaces, 65 KiB JSON objects, 1,000 tasks per mission, 200 attempts per task, 500 checkpoints and 500 approvals per mission. Read APIs clamp to 200 missions, 1,000 tasks, and 200 attempts/checkpoints/approvals. Task attempts and approval decisions are append-only in practice: a finished attempt cannot be finished again, and a decided approval cannot be re-decided.
+
+This layer performs no decomposition, scheduling, scoring, provider calls, tool calls, or approvals. Approvals are records only; no code consumes an approved record to grant execution.
+
+## MCP read-only client foundation
+
+`src/mcp/` owns the MCP boundary. `config.rs` validates persisted server settings without I/O; `manager.rs` owns one background OS thread per explicit connection and a bounded event channel; the UI only polls that channel. `rmcp` 3.10 is compiled with `client`, `transport-child-process`, and `transport-streamable-http-client-reqwest` only, so no server implementation, sampling, or OAuth machinery is linked.
+
+The client negotiates through `rmcp`, including the stateless 2026-07-28 revision, and displays the negotiated version, server identity, and advertised capabilities. Discovery is a bounded sequence of `tools/list` pages. Resource and prompt capabilities are reported but never exercised. There is deliberately no `tools/call`, resource read, prompt retrieval, sampling, elicitation, auto-connect, or auto-reconnect path; a source test fails if those method names appear in `src/mcp/`.
+
+STDIO commands are spawned directly, never through a shell. Environment variables are cleared and only names in the server's allowlist are copied, plus `NEXUS_MCP_CLIENT=1`. stderr is drained with a 64 KiB cap and never shown as protocol content. Streamable HTTP uses a dedicated `reqwest` client with redirects disabled, a 120-second idle timeout, and an 8 MiB SSE event cap; URLs must use HTTPS or loopback HTTP and may not embed credentials.
+
+Metadata is untrusted: at most 1,000 tools, 10 pages, 256-byte names, 8 KiB descriptions, and 256 KiB per schema are retained, duplicate names are skipped, and errors are mapped to fixed local messages rather than raw SDK text. Disconnect closes the transport with a 3-second timeout. A retained catalog is marked stale after disconnect or a failed refresh. No tool execution or agent loop consumes this catalog in this milestone.
+
 ## Phase 4.5 UI and history boundary
 
 The desktop shell routes six sections: Chat, Providers, MCP, Usage, Resources, and Settings. Settings owns appearance and history preferences; Providers owns profiles, model catalogs, prices, and Keychain actions; Usage reads bounded aggregates from SQLite.

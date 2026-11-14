@@ -11,8 +11,17 @@ use crate::chat::{
     MessageStatus, StoredMessage, TokenUsage, ToolCall,
 };
 use crate::config::Protocol;
+use crate::mission::{
+    Approval, ApprovalId, ApprovalKind, ApprovalStatus, AttemptId, AttemptStatus, Checkpoint,
+    CheckpointId, CheckpointKind, MAX_APPROVALS, MAX_APPROVALS_PER_MISSION, MAX_ATTEMPTS,
+    MAX_ATTEMPTS_PER_TASK, MAX_CHECKPOINTS, MAX_CHECKPOINTS_PER_MISSION, MAX_MISSIONS,
+    MAX_MODEL_BYTES, MAX_NOTE_BYTES, MAX_OBJECTIVE_BYTES, MAX_SUMMARY_BYTES, MAX_TASKS,
+    MAX_TASKS_PER_MISSION, MAX_TITLE_BYTES, MAX_WORKSPACE_BYTES, Mission, MissionId, MissionStatus,
+    MissionSummary, MissionTask, MissionTaskId, NewApproval, NewCheckpoint, NewMission,
+    NewMissionTask, TaskAttempt, TaskStatus, json_object, validate_optional_text, validate_text,
+};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 pub const DEFAULT_MAX_CONVERSATIONS: u32 = 500;
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +54,8 @@ pub enum StorageError {
     UnsupportedSchema { found: i64 },
     #[error("history is disabled; conversation content was not written")]
     HistoryDisabled,
+    #[error("invalid mission data: {0}")]
+    InvalidMission(&'static str),
 }
 
 pub fn unix_time_now() -> u64 {
@@ -185,7 +196,7 @@ impl Storage {
         if found > SCHEMA_VERSION {
             return Err(StorageError::UnsupportedSchema { found });
         }
-        if found == 0 {
+        if found < 1 {
             self.connection.execute_batch(
                 "
                 BEGIN IMMEDIATE;
@@ -247,6 +258,91 @@ impl Storage {
                 CREATE INDEX idx_tool_calls_conversation
                     ON tool_calls(conversation_id, id);
                 PRAGMA user_version = 1;
+                COMMIT;
+                ",
+            )?;
+        }
+        if found < 2 {
+            self.connection.execute_batch(
+                "
+                BEGIN IMMEDIATE;
+                CREATE TABLE missions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    objective TEXT NOT NULL,
+                    constraints_json TEXT NOT NULL DEFAULT '{}',
+                    workspace TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    started_at INTEGER,
+                    completed_at INTEGER
+                );
+                CREATE INDEX idx_missions_updated
+                    ON missions(updated_at DESC, id DESC);
+                CREATE TABLE mission_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mission_id INTEGER NOT NULL
+                        REFERENCES missions(id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    objective TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    provider_id INTEGER,
+                    model TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    started_at INTEGER,
+                    completed_at INTEGER,
+                    UNIQUE(mission_id, ordinal)
+                );
+                CREATE INDEX idx_mission_tasks_mission
+                    ON mission_tasks(mission_id, ordinal);
+                CREATE TABLE task_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL
+                        REFERENCES mission_tasks(id) ON DELETE CASCADE,
+                    attempt_number INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    started_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    UNIQUE(task_id, attempt_number)
+                );
+                CREATE INDEX idx_task_attempts_task
+                    ON task_attempts(task_id, attempt_number);
+                CREATE TABLE checkpoints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mission_id INTEGER NOT NULL
+                        REFERENCES missions(id) ON DELETE CASCADE,
+                    task_id INTEGER
+                        REFERENCES mission_tasks(id) ON DELETE SET NULL,
+                    kind TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX idx_checkpoints_mission
+                    ON checkpoints(mission_id, id);
+                CREATE TABLE approvals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mission_id INTEGER NOT NULL
+                        REFERENCES missions(id) ON DELETE CASCADE,
+                    task_id INTEGER
+                        REFERENCES mission_tasks(id) ON DELETE SET NULL,
+                    kind TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL,
+                    requested_at INTEGER NOT NULL,
+                    decided_at INTEGER,
+                    decision_note TEXT
+                );
+                CREATE INDEX idx_approvals_mission
+                    ON approvals(mission_id, id);
+                CREATE INDEX idx_approvals_pending
+                    ON approvals(status, requested_at);
+                PRAGMA user_version = 2;
                 COMMIT;
                 ",
             )?;
@@ -521,7 +617,7 @@ impl Storage {
 
     pub fn clear_all_history(&self) -> Result<(), StorageError> {
         self.connection
-            .execute_batch("DELETE FROM conversations;")?;
+            .execute_batch("DELETE FROM missions; DELETE FROM conversations;")?;
         Ok(())
     }
 
@@ -738,6 +834,641 @@ impl Storage {
         }
         Ok(removed)
     }
+
+    // ------------------------------------------------------------------
+    // Mission persistence (Phase 5 schema foundation)
+    // ------------------------------------------------------------------
+
+    pub fn create_mission(&self, draft: NewMission<'_>) -> Result<MissionId, StorageError> {
+        self.require_history_writes()?;
+        validate_text(draft.title, MAX_TITLE_BYTES, "mission title is invalid")
+            .map_err(StorageError::InvalidMission)?;
+        validate_text(
+            draft.objective,
+            MAX_OBJECTIVE_BYTES,
+            "mission objective is invalid",
+        )
+        .map_err(StorageError::InvalidMission)?;
+        if draft.workspace.len() > MAX_WORKSPACE_BYTES || draft.workspace.contains('\0') {
+            return Err(StorageError::InvalidMission("mission workspace is invalid"));
+        }
+        let constraints = json_object(draft.constraints, "mission constraints are invalid")
+            .map_err(StorageError::InvalidMission)?;
+        let now = unix_time_now() as i64;
+        self.connection.execute(
+            "INSERT INTO missions
+             (title, objective, constraints_json, workspace, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![
+                draft.title.trim(),
+                draft.objective.trim(),
+                constraints,
+                draft.workspace.trim(),
+                MissionStatus::Draft.as_str(),
+                now,
+            ],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn list_missions(&self, limit: u32) -> Result<Vec<MissionSummary>, StorageError> {
+        let limit = limit.clamp(1, MAX_MISSIONS);
+        let mut statement = self.connection.prepare(
+            "SELECT m.id, m.title, m.status, m.created_at, m.updated_at,
+                    (SELECT COUNT(*) FROM mission_tasks t WHERE t.mission_id = m.id),
+                    (SELECT COUNT(*) FROM approvals a
+                     WHERE a.mission_id = m.id AND a.status = 'pending')
+             FROM missions m
+             ORDER BY m.updated_at DESC, m.id DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit as i64], |row| {
+            let status: String = row.get(2)?;
+            Ok(MissionSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                status: parse_mission_status(&status)?,
+                created_at: from_i64(row.get(3)?, "created_at")?,
+                updated_at: from_i64(row.get(4)?, "updated_at")?,
+                task_count: from_i64_u32(row.get(5)?, "task_count")?,
+                pending_approval_count: from_i64_u32(row.get(6)?, "pending_approval_count")?,
+            })
+        })?;
+        let mut missions = Vec::new();
+        for row in rows {
+            missions.push(row?);
+        }
+        Ok(missions)
+    }
+
+    pub fn load_mission(&self, id: MissionId) -> Result<Option<Mission>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, title, objective, constraints_json, workspace, status,
+                    created_at, updated_at, started_at, completed_at
+             FROM missions WHERE id = ?1",
+        )?;
+        let mission = statement
+            .query_row([id], |row| {
+                let status: String = row.get(5)?;
+                let constraints: String = row.get(3)?;
+                Ok(Mission {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    objective: row.get(2)?,
+                    constraints: parse_json_column(&constraints, 3)?,
+                    workspace: row.get(4)?,
+                    status: parse_mission_status(&status)?,
+                    created_at: from_i64(row.get(6)?, "created_at")?,
+                    updated_at: from_i64(row.get(7)?, "updated_at")?,
+                    started_at: opt_timestamp(row.get(8)?),
+                    completed_at: opt_timestamp(row.get(9)?),
+                })
+            })
+            .optional()?;
+        Ok(mission)
+    }
+
+    pub fn update_mission_status(
+        &self,
+        id: MissionId,
+        next: MissionStatus,
+    ) -> Result<(), StorageError> {
+        self.require_history_writes()?;
+        let current: Option<String> = self
+            .connection
+            .query_row("SELECT status FROM missions WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(current) = current else {
+            return Err(StorageError::InvalidMission("mission not found"));
+        };
+        let current =
+            MissionStatus::parse(&current).ok_or(StorageError::InvalidMission("invalid status"))?;
+        if !current.can_transition_to(next) {
+            return Err(StorageError::InvalidMission(
+                "mission status transition is not allowed",
+            ));
+        }
+        self.connection.execute(
+            "UPDATE missions
+             SET status = ?1, updated_at = ?2,
+                 started_at = CASE
+                     WHEN ?1 = 'running' AND started_at IS NULL THEN ?2
+                     ELSE started_at END,
+                 completed_at = CASE
+                     WHEN ?1 IN ('completed', 'failed', 'cancelled')
+                          AND completed_at IS NULL THEN ?2
+                     ELSE completed_at END
+             WHERE id = ?3",
+            params![next.as_str(), unix_time_now() as i64, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_mission(&self, id: MissionId) -> Result<(), StorageError> {
+        self.connection
+            .execute("DELETE FROM missions WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn add_mission_task(
+        &self,
+        mission_id: MissionId,
+        draft: NewMissionTask<'_>,
+    ) -> Result<MissionTaskId, StorageError> {
+        self.require_history_writes()?;
+        self.require_mission(mission_id)?;
+        validate_text(draft.title, MAX_TITLE_BYTES, "task title is invalid")
+            .map_err(StorageError::InvalidMission)?;
+        validate_text(
+            draft.objective,
+            MAX_OBJECTIVE_BYTES,
+            "task objective is invalid",
+        )
+        .map_err(StorageError::InvalidMission)?;
+        validate_optional_text(draft.model, MAX_MODEL_BYTES, "task model is invalid")
+            .map_err(StorageError::InvalidMission)?;
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM mission_tasks WHERE mission_id = ?1",
+            [mission_id],
+            |row| row.get(0),
+        )?;
+        if count >= i64::from(MAX_TASKS_PER_MISSION) {
+            return Err(StorageError::InvalidMission("mission task limit reached"));
+        }
+        let ordinal: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM mission_tasks WHERE mission_id = ?1",
+            [mission_id],
+            |row| row.get(0),
+        )?;
+        let now = unix_time_now() as i64;
+        self.connection.execute(
+            "INSERT INTO mission_tasks
+             (mission_id, ordinal, title, objective, status, provider_id, model,
+              created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![
+                mission_id,
+                ordinal,
+                draft.title.trim(),
+                draft.objective.trim(),
+                TaskStatus::Pending.as_str(),
+                draft.provider_id.map(|value| value as i64),
+                draft.model.map(str::trim),
+                now,
+            ],
+        )?;
+        let id = self.connection.last_insert_rowid();
+        self.touch_mission(mission_id)?;
+        Ok(id)
+    }
+
+    pub fn list_mission_tasks(
+        &self,
+        mission_id: MissionId,
+        limit: u32,
+    ) -> Result<Vec<MissionTask>, StorageError> {
+        let limit = limit.clamp(1, MAX_TASKS);
+        let mut statement = self.connection.prepare(
+            "SELECT id, mission_id, ordinal, title, objective, status,
+                    provider_id, model, created_at, updated_at,
+                    started_at, completed_at
+             FROM mission_tasks
+             WHERE mission_id = ?1
+             ORDER BY ordinal ASC, id ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![mission_id, limit as i64], |row| {
+            parse_mission_task(row)
+        })?;
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row?);
+        }
+        Ok(tasks)
+    }
+
+    pub fn load_mission_task(
+        &self,
+        id: MissionTaskId,
+    ) -> Result<Option<MissionTask>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, mission_id, ordinal, title, objective, status,
+                    provider_id, model, created_at, updated_at,
+                    started_at, completed_at
+             FROM mission_tasks WHERE id = ?1",
+        )?;
+        let task = statement.query_row([id], parse_mission_task).optional()?;
+        Ok(task)
+    }
+
+    pub fn update_mission_task_status(
+        &self,
+        id: MissionTaskId,
+        next: TaskStatus,
+    ) -> Result<(), StorageError> {
+        self.require_history_writes()?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT mission_id, status FROM mission_tasks WHERE id = ?1",
+                [id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((mission_id, current)) = row else {
+            return Err(StorageError::InvalidMission("task not found"));
+        };
+        let current =
+            TaskStatus::parse(&current).ok_or(StorageError::InvalidMission("invalid status"))?;
+        if !current.can_transition_to(next) {
+            return Err(StorageError::InvalidMission(
+                "task status transition is not allowed",
+            ));
+        }
+        self.connection.execute(
+            "UPDATE mission_tasks
+             SET status = ?1, updated_at = ?2,
+                 started_at = CASE
+                     WHEN ?1 = 'running' AND started_at IS NULL THEN ?2
+                     ELSE started_at END,
+                 completed_at = CASE
+                     WHEN ?1 IN ('completed', 'failed', 'cancelled', 'skipped')
+                          AND completed_at IS NULL THEN ?2
+                     ELSE completed_at END
+             WHERE id = ?3",
+            params![next.as_str(), unix_time_now() as i64, id],
+        )?;
+        self.touch_mission(mission_id)?;
+        Ok(())
+    }
+
+    pub fn start_task_attempt(&self, task_id: MissionTaskId) -> Result<AttemptId, StorageError> {
+        self.require_history_writes()?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT mission_id, status FROM mission_tasks WHERE id = ?1",
+                [task_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((mission_id, status)) = row else {
+            return Err(StorageError::InvalidMission("task not found"));
+        };
+        let status =
+            TaskStatus::parse(&status).ok_or(StorageError::InvalidMission("invalid status"))?;
+        if !matches!(status, TaskStatus::Ready | TaskStatus::Running) {
+            return Err(StorageError::InvalidMission(
+                "task is not ready for an attempt",
+            ));
+        }
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM task_attempts WHERE task_id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        if count >= i64::from(MAX_ATTEMPTS_PER_TASK) {
+            return Err(StorageError::InvalidMission("attempt limit reached"));
+        }
+        let number: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM task_attempts WHERE task_id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        let now = unix_time_now() as i64;
+        self.connection.execute(
+            "INSERT INTO task_attempts
+             (task_id, attempt_number, status, started_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, number, AttemptStatus::Running.as_str(), now],
+        )?;
+        let id = self.connection.last_insert_rowid();
+        self.touch_mission(mission_id)?;
+        Ok(id)
+    }
+
+    pub fn finish_task_attempt(
+        &self,
+        id: AttemptId,
+        status: AttemptStatus,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.require_history_writes()?;
+        if !status.is_terminal() {
+            return Err(StorageError::InvalidMission(
+                "attempt must end in a terminal status",
+            ));
+        }
+        validate_optional_text(
+            error,
+            crate::mission::MAX_ERROR_BYTES,
+            "attempt error is invalid",
+        )
+        .map_err(StorageError::InvalidMission)?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT a.status, t.mission_id
+                 FROM task_attempts a
+                 JOIN mission_tasks t ON t.id = a.task_id
+                 WHERE a.id = ?1",
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((current, mission_id)) = row else {
+            return Err(StorageError::InvalidMission("attempt not found"));
+        };
+        let current =
+            AttemptStatus::parse(&current).ok_or(StorageError::InvalidMission("invalid status"))?;
+        if current != AttemptStatus::Running {
+            return Err(StorageError::InvalidMission("attempt already finished"));
+        }
+        self.connection.execute(
+            "UPDATE task_attempts
+             SET status = ?1, error = ?2, completed_at = ?3
+             WHERE id = ?4",
+            params![status.as_str(), error, unix_time_now() as i64, id],
+        )?;
+        self.touch_mission(mission_id)?;
+        Ok(())
+    }
+
+    pub fn list_task_attempts(
+        &self,
+        task_id: MissionTaskId,
+        limit: u32,
+    ) -> Result<Vec<TaskAttempt>, StorageError> {
+        let limit = limit.clamp(1, MAX_ATTEMPTS);
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_id, attempt_number, status, error,
+                    started_at, completed_at
+             FROM task_attempts WHERE task_id = ?1
+             ORDER BY attempt_number ASC, id ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![task_id, limit as i64], |row| {
+            let status: String = row.get(3)?;
+            Ok(TaskAttempt {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                attempt_number: from_i64_u32(row.get(2)?, "attempt_number")?,
+                status: parse_attempt_status(&status)?,
+                error: row.get(4)?,
+                started_at: from_i64(row.get(5)?, "started_at")?,
+                completed_at: opt_timestamp(row.get(6)?),
+            })
+        })?;
+        let mut attempts = Vec::new();
+        for row in rows {
+            attempts.push(row?);
+        }
+        Ok(attempts)
+    }
+
+    pub fn add_checkpoint(
+        &self,
+        mission_id: MissionId,
+        draft: NewCheckpoint<'_>,
+    ) -> Result<CheckpointId, StorageError> {
+        self.require_history_writes()?;
+        self.require_mission(mission_id)?;
+        validate_text(draft.label, MAX_TITLE_BYTES, "checkpoint label is invalid")
+            .map_err(StorageError::InvalidMission)?;
+        if let Some(task_id) = draft.task_id {
+            self.require_task_in_mission(task_id, mission_id)?;
+        }
+        let payload = json_object(draft.payload, "checkpoint payload is invalid")
+            .map_err(StorageError::InvalidMission)?;
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM checkpoints WHERE mission_id = ?1",
+            [mission_id],
+            |row| row.get(0),
+        )?;
+        if count >= i64::from(MAX_CHECKPOINTS_PER_MISSION) {
+            return Err(StorageError::InvalidMission("checkpoint limit reached"));
+        }
+        self.connection.execute(
+            "INSERT INTO checkpoints
+             (mission_id, task_id, kind, label, payload_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                mission_id,
+                draft.task_id,
+                draft.kind.as_str(),
+                draft.label.trim(),
+                payload,
+                unix_time_now() as i64,
+            ],
+        )?;
+        let id = self.connection.last_insert_rowid();
+        self.touch_mission(mission_id)?;
+        Ok(id)
+    }
+
+    pub fn list_checkpoints(
+        &self,
+        mission_id: MissionId,
+        limit: u32,
+    ) -> Result<Vec<Checkpoint>, StorageError> {
+        let limit = limit.clamp(1, MAX_CHECKPOINTS);
+        let mut statement = self.connection.prepare(
+            "SELECT id, mission_id, task_id, kind, label, payload_json, created_at
+             FROM checkpoints WHERE mission_id = ?1
+             ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![mission_id, limit as i64], |row| {
+            let kind: String = row.get(3)?;
+            let payload: String = row.get(5)?;
+            Ok(Checkpoint {
+                id: row.get(0)?,
+                mission_id: row.get(1)?,
+                task_id: row.get(2)?,
+                kind: parse_checkpoint_kind(&kind)?,
+                label: row.get(4)?,
+                payload: parse_json_column(&payload, 5)?,
+                created_at: from_i64(row.get(6)?, "created_at")?,
+            })
+        })?;
+        let mut checkpoints = Vec::new();
+        for row in rows {
+            checkpoints.push(row?);
+        }
+        Ok(checkpoints)
+    }
+
+    pub fn create_approval(
+        &self,
+        mission_id: MissionId,
+        draft: NewApproval<'_>,
+    ) -> Result<ApprovalId, StorageError> {
+        self.require_history_writes()?;
+        self.require_mission(mission_id)?;
+        validate_text(
+            draft.summary,
+            MAX_SUMMARY_BYTES,
+            "approval summary is invalid",
+        )
+        .map_err(StorageError::InvalidMission)?;
+        if let Some(task_id) = draft.task_id {
+            self.require_task_in_mission(task_id, mission_id)?;
+        }
+        let payload = json_object(draft.payload, "approval payload is invalid")
+            .map_err(StorageError::InvalidMission)?;
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM approvals WHERE mission_id = ?1",
+            [mission_id],
+            |row| row.get(0),
+        )?;
+        if count >= i64::from(MAX_APPROVALS_PER_MISSION) {
+            return Err(StorageError::InvalidMission("approval limit reached"));
+        }
+        self.connection.execute(
+            "INSERT INTO approvals
+             (mission_id, task_id, kind, summary, payload_json, status, requested_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                mission_id,
+                draft.task_id,
+                draft.kind.as_str(),
+                draft.summary.trim(),
+                payload,
+                ApprovalStatus::Pending.as_str(),
+                unix_time_now() as i64,
+            ],
+        )?;
+        let id = self.connection.last_insert_rowid();
+        self.touch_mission(mission_id)?;
+        Ok(id)
+    }
+
+    pub fn decide_approval(
+        &self,
+        id: ApprovalId,
+        decision: ApprovalStatus,
+        note: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.require_history_writes()?;
+        if !decision.is_decision() {
+            return Err(StorageError::InvalidMission(
+                "approval decision is required",
+            ));
+        }
+        validate_optional_text(note, MAX_NOTE_BYTES, "approval note is invalid")
+            .map_err(StorageError::InvalidMission)?;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT mission_id, status FROM approvals WHERE id = ?1",
+                [id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((mission_id, current)) = row else {
+            return Err(StorageError::InvalidMission("approval not found"));
+        };
+        let current = ApprovalStatus::parse(&current)
+            .ok_or(StorageError::InvalidMission("invalid status"))?;
+        if current != ApprovalStatus::Pending {
+            return Err(StorageError::InvalidMission("approval already decided"));
+        }
+        self.connection.execute(
+            "UPDATE approvals
+             SET status = ?1, decided_at = ?2, decision_note = ?3
+             WHERE id = ?4",
+            params![decision.as_str(), unix_time_now() as i64, note, id],
+        )?;
+        self.touch_mission(mission_id)?;
+        Ok(())
+    }
+
+    pub fn list_approvals(
+        &self,
+        mission_id: MissionId,
+        limit: u32,
+    ) -> Result<Vec<Approval>, StorageError> {
+        let limit = limit.clamp(1, MAX_APPROVALS);
+        let mut statement = self.connection.prepare(
+            "SELECT id, mission_id, task_id, kind, summary, payload_json,
+                    status, requested_at, decided_at, decision_note
+             FROM approvals WHERE mission_id = ?1
+             ORDER BY requested_at DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![mission_id, limit as i64], parse_approval)?;
+        let mut approvals = Vec::new();
+        for row in rows {
+            approvals.push(row?);
+        }
+        Ok(approvals)
+    }
+
+    pub fn pending_approvals(&self, limit: u32) -> Result<Vec<Approval>, StorageError> {
+        let limit = limit.clamp(1, MAX_APPROVALS);
+        let mut statement = self.connection.prepare(
+            "SELECT id, mission_id, task_id, kind, summary, payload_json,
+                    status, requested_at, decided_at, decision_note
+             FROM approvals WHERE status = 'pending'
+             ORDER BY requested_at ASC, id ASC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit as i64], parse_approval)?;
+        let mut approvals = Vec::new();
+        for row in rows {
+            approvals.push(row?);
+        }
+        Ok(approvals)
+    }
+
+    pub fn mission_count(&self) -> Result<u64, StorageError> {
+        let count: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM missions", [], |row| row.get(0))?;
+        Ok(from_i64(count, "mission_count")?)
+    }
+
+    fn touch_mission(&self, id: MissionId) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE missions SET updated_at = ?1 WHERE id = ?2",
+            params![unix_time_now() as i64, id],
+        )?;
+        Ok(())
+    }
+
+    fn require_mission(&self, id: MissionId) -> Result<(), StorageError> {
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM missions WHERE id = ?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            Ok(())
+        } else {
+            Err(StorageError::InvalidMission("mission not found"))
+        }
+    }
+
+    fn require_task_in_mission(
+        &self,
+        task_id: MissionTaskId,
+        mission_id: MissionId,
+    ) -> Result<(), StorageError> {
+        let found: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT mission_id FROM mission_tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match found {
+            Some(found) if found == mission_id => Ok(()),
+            Some(_) => Err(StorageError::InvalidMission(
+                "task does not belong to this mission",
+            )),
+            None => Err(StorageError::InvalidMission("task not found")),
+        }
+    }
 }
 
 fn protocol_str(protocol: Protocol) -> &'static str {
@@ -771,6 +1502,89 @@ fn parse_status(value: &str) -> Result<MessageStatus, rusqlite::Error> {
         .ok_or_else(|| conversion_error(6, format!("unknown message status {value}")))
 }
 
+fn parse_mission_status(value: &str) -> Result<MissionStatus, rusqlite::Error> {
+    MissionStatus::parse(value)
+        .ok_or_else(|| conversion_error(2, format!("unknown mission status {value}")))
+}
+
+fn parse_task_status(value: &str) -> Result<TaskStatus, rusqlite::Error> {
+    TaskStatus::parse(value)
+        .ok_or_else(|| conversion_error(5, format!("unknown task status {value}")))
+}
+
+fn parse_attempt_status(value: &str) -> Result<AttemptStatus, rusqlite::Error> {
+    AttemptStatus::parse(value)
+        .ok_or_else(|| conversion_error(3, format!("unknown attempt status {value}")))
+}
+
+fn parse_checkpoint_kind(value: &str) -> Result<CheckpointKind, rusqlite::Error> {
+    CheckpointKind::parse(value)
+        .ok_or_else(|| conversion_error(3, format!("unknown checkpoint kind {value}")))
+}
+
+fn parse_approval_kind(value: &str) -> Result<ApprovalKind, rusqlite::Error> {
+    ApprovalKind::parse(value)
+        .ok_or_else(|| conversion_error(3, format!("unknown approval kind {value}")))
+}
+
+fn parse_approval_status(value: &str) -> Result<ApprovalStatus, rusqlite::Error> {
+    ApprovalStatus::parse(value)
+        .ok_or_else(|| conversion_error(6, format!("unknown approval status {value}")))
+}
+
+fn parse_json_column(value: &str, column: usize) -> Result<serde_json::Value, rusqlite::Error> {
+    serde_json::from_str(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn parse_mission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<MissionTask> {
+    let status: String = row.get(5)?;
+    Ok(MissionTask {
+        id: row.get(0)?,
+        mission_id: row.get(1)?,
+        ordinal: from_i64_u32(row.get(2)?, "ordinal")?,
+        title: row.get(3)?,
+        objective: row.get(4)?,
+        status: parse_task_status(&status)?,
+        provider_id: row
+            .get::<_, Option<i64>>(6)?
+            .map(|value| from_i64(value, "provider_id"))
+            .transpose()?,
+        model: row.get(7)?,
+        created_at: from_i64(row.get(8)?, "created_at")?,
+        updated_at: from_i64(row.get(9)?, "updated_at")?,
+        started_at: opt_timestamp(row.get(10)?),
+        completed_at: opt_timestamp(row.get(11)?),
+    })
+}
+
+fn parse_approval(row: &rusqlite::Row<'_>) -> rusqlite::Result<Approval> {
+    let kind: String = row.get(3)?;
+    let payload: String = row.get(5)?;
+    let status: String = row.get(6)?;
+    Ok(Approval {
+        id: row.get(0)?,
+        mission_id: row.get(1)?,
+        task_id: row.get(2)?,
+        kind: parse_approval_kind(&kind)?,
+        summary: row.get(4)?,
+        payload: parse_json_column(&payload, 5)?,
+        status: parse_approval_status(&status)?,
+        requested_at: from_i64(row.get(7)?, "requested_at")?,
+        decided_at: opt_timestamp(row.get(8)?),
+        decision_note: row.get(9)?,
+    })
+}
+
+fn opt_timestamp(value: Option<i64>) -> Option<u64> {
+    value.and_then(|value| u64::try_from(value).ok())
+}
+
 fn conversion_error(column: usize, message: String) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         column,
@@ -781,6 +1595,11 @@ fn conversion_error(column: usize, message: String) -> rusqlite::Error {
 
 fn from_i64(value: i64, field: &str) -> Result<u64, rusqlite::Error> {
     u64::try_from(value).map_err(|_| conversion_error(0, format!("negative {field} value {value}")))
+}
+
+fn from_i64_u32(value: i64, field: &str) -> Result<u32, rusqlite::Error> {
+    u32::try_from(from_i64(value, field)?)
+        .map_err(|_| conversion_error(0, format!("{field} value is too large")))
 }
 
 fn opt_i64(value: Option<i64>) -> u64 {
@@ -1073,6 +1892,407 @@ mod tests {
         storage.delete_conversation(id).unwrap();
         assert_eq!(storage.conversation_count().unwrap(), 0);
         assert!(storage.load_messages(id, 10).unwrap().is_empty());
+    }
+
+    fn mission_draft<'a>(constraints: &'a serde_json::Value) -> NewMission<'a> {
+        NewMission {
+            title: "Build a release",
+            objective: "Ship the next milestone without regressions.",
+            constraints,
+            workspace: "/tmp/workspace",
+        }
+    }
+
+    #[test]
+    fn mission_lifecycle_persists_and_enforces_transitions() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({"budget_usd": 5, "offline": true});
+        let id = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let mission = storage.load_mission(id).unwrap().unwrap();
+        assert_eq!(mission.status, MissionStatus::Draft);
+        assert_eq!(mission.constraints, constraints);
+        assert_eq!(mission.workspace, "/tmp/workspace");
+        assert_eq!(storage.mission_count().unwrap(), 1);
+
+        let listed = storage.list_missions(10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].task_count, 0);
+        assert_eq!(listed[0].pending_approval_count, 0);
+
+        storage
+            .update_mission_status(id, MissionStatus::Planned)
+            .unwrap();
+        storage
+            .update_mission_status(id, MissionStatus::Running)
+            .unwrap();
+        let running = storage.load_mission(id).unwrap().unwrap();
+        assert!(running.started_at.is_some());
+        assert!(matches!(
+            storage.update_mission_status(id, MissionStatus::Draft),
+            Err(StorageError::InvalidMission(_))
+        ));
+        storage
+            .update_mission_status(id, MissionStatus::Completed)
+            .unwrap();
+        let completed = storage.load_mission(id).unwrap().unwrap();
+        assert!(completed.completed_at.is_some());
+        assert!(matches!(
+            storage.update_mission_status(id, MissionStatus::Running),
+            Err(StorageError::InvalidMission(_))
+        ));
+    }
+
+    #[test]
+    fn mission_tasks_keep_order_and_reject_invalid_status_changes() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({});
+        let mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let first = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "First",
+                    objective: "Do the first step.",
+                    provider_id: Some(3),
+                    model: Some("auto"),
+                },
+            )
+            .unwrap();
+        let second = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Second",
+                    objective: "Do the second step.",
+                    provider_id: None,
+                    model: None,
+                },
+            )
+            .unwrap();
+        let tasks = storage.list_mission_tasks(mission, 10).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, first);
+        assert_eq!(tasks[0].ordinal, 1);
+        assert_eq!(tasks[1].id, second);
+        assert_eq!(tasks[1].ordinal, 2);
+        assert_eq!(tasks[0].provider_id, Some(3));
+        assert_eq!(storage.list_mission_tasks(mission, 1).unwrap().len(), 1);
+
+        storage
+            .update_mission_task_status(first, TaskStatus::Ready)
+            .unwrap();
+        storage
+            .update_mission_task_status(first, TaskStatus::Running)
+            .unwrap();
+        storage
+            .update_mission_task_status(first, TaskStatus::Completed)
+            .unwrap();
+        let loaded = storage.load_mission_task(first).unwrap().unwrap();
+        assert_eq!(loaded.status, TaskStatus::Completed);
+        assert!(loaded.started_at.is_some());
+        assert!(loaded.completed_at.is_some());
+        assert!(matches!(
+            storage.update_mission_task_status(first, TaskStatus::Running),
+            Err(StorageError::InvalidMission(_))
+        ));
+    }
+
+    #[test]
+    fn attempts_increment_and_cannot_be_finished_twice() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({});
+        let mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let task = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Attempt",
+                    objective: "Try once.",
+                    provider_id: None,
+                    model: None,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            storage.start_task_attempt(task),
+            Err(StorageError::InvalidMission(_))
+        ));
+        storage
+            .update_mission_task_status(task, TaskStatus::Ready)
+            .unwrap();
+        let first = storage.start_task_attempt(task).unwrap();
+        let second = storage.start_task_attempt(task).unwrap();
+        let attempts = storage.list_task_attempts(task, 10).unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].attempt_number, 1);
+        assert_eq!(attempts[1].attempt_number, 2);
+        assert_eq!(attempts[0].status, AttemptStatus::Running);
+
+        storage
+            .finish_task_attempt(first, AttemptStatus::Succeeded, None)
+            .unwrap();
+        let finished = storage.list_task_attempts(task, 10).unwrap();
+        assert_eq!(finished[0].status, AttemptStatus::Succeeded);
+        assert!(finished[0].completed_at.is_some());
+        assert!(matches!(
+            storage.finish_task_attempt(second, AttemptStatus::Running, None),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert!(matches!(
+            storage.finish_task_attempt(first, AttemptStatus::Failed, Some("late")),
+            Err(StorageError::InvalidMission(_))
+        ));
+    }
+
+    #[test]
+    fn checkpoints_and_approvals_are_bounded_to_their_mission() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({});
+        let first = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let second = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let task = storage
+            .add_mission_task(
+                first,
+                NewMissionTask {
+                    title: "Risky",
+                    objective: "Explain the risk.",
+                    provider_id: None,
+                    model: None,
+                },
+            )
+            .unwrap();
+        let payload = serde_json::json!({"path": "/tmp/file"});
+        storage
+            .add_checkpoint(
+                first,
+                NewCheckpoint {
+                    task_id: Some(task),
+                    kind: CheckpointKind::TaskCompleted,
+                    label: "Task finished",
+                    payload: &payload,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            storage.add_checkpoint(
+                second,
+                NewCheckpoint {
+                    task_id: Some(task),
+                    kind: CheckpointKind::Manual,
+                    label: "Wrong mission",
+                    payload: &payload,
+                },
+            ),
+            Err(StorageError::InvalidMission(_))
+        ));
+        let checkpoints = storage.list_checkpoints(first, 10).unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].kind, CheckpointKind::TaskCompleted);
+        assert_eq!(checkpoints[0].payload, payload);
+
+        let approval = storage
+            .create_approval(
+                first,
+                NewApproval {
+                    task_id: Some(task),
+                    kind: ApprovalKind::FileWrite,
+                    summary: "Write a file inside the workspace",
+                    payload: &payload,
+                },
+            )
+            .unwrap();
+        assert_eq!(storage.pending_approvals(10).unwrap().len(), 1);
+        let summary = storage
+            .list_missions(10)
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == first)
+            .unwrap();
+        assert_eq!(summary.pending_approval_count, 1);
+        storage
+            .decide_approval(approval, ApprovalStatus::Approved, Some("Checked"))
+            .unwrap();
+        assert!(storage.pending_approvals(10).unwrap().is_empty());
+        let approvals = storage.list_approvals(first, 10).unwrap();
+        assert_eq!(approvals[0].status, ApprovalStatus::Approved);
+        assert!(approvals[0].decided_at.is_some());
+        assert!(matches!(
+            storage.decide_approval(approval, ApprovalStatus::Denied, None),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert!(matches!(
+            storage.decide_approval(approval, ApprovalStatus::Pending, None),
+            Err(StorageError::InvalidMission(_))
+        ));
+    }
+
+    #[test]
+    fn deleting_a_mission_cascades_and_clear_history_removes_missions() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({});
+        let mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let task = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Work",
+                    objective: "Do work.",
+                    provider_id: None,
+                    model: None,
+                },
+            )
+            .unwrap();
+        storage
+            .update_mission_task_status(task, TaskStatus::Ready)
+            .unwrap();
+        let attempt = storage.start_task_attempt(task).unwrap();
+        storage
+            .finish_task_attempt(attempt, AttemptStatus::Succeeded, None)
+            .unwrap();
+        let payload = serde_json::json!({});
+        storage
+            .add_checkpoint(
+                mission,
+                NewCheckpoint {
+                    task_id: Some(task),
+                    kind: CheckpointKind::Progress,
+                    label: "Halfway",
+                    payload: &payload,
+                },
+            )
+            .unwrap();
+        let approval = storage
+            .create_approval(
+                mission,
+                NewApproval {
+                    task_id: None,
+                    kind: ApprovalKind::Other,
+                    summary: "Review",
+                    payload: &payload,
+                },
+            )
+            .unwrap();
+        storage.delete_mission(mission).unwrap();
+        assert_eq!(storage.mission_count().unwrap(), 0);
+        assert!(storage.list_mission_tasks(mission, 10).unwrap().is_empty());
+        assert!(storage.list_task_attempts(task, 10).unwrap().is_empty());
+        assert!(storage.list_checkpoints(mission, 10).unwrap().is_empty());
+        assert!(storage.list_approvals(mission, 10).unwrap().is_empty());
+        assert!(storage.pending_approvals(10).unwrap().is_empty());
+        assert!(storage.load_mission(mission).unwrap().is_none());
+        let _ = approval;
+
+        let kept = storage.create_mission(mission_draft(&constraints)).unwrap();
+        assert_eq!(storage.mission_count().unwrap(), 1);
+        storage.clear_all_history().unwrap();
+        assert_eq!(storage.mission_count().unwrap(), 0);
+        assert!(storage.load_mission(kept).unwrap().is_none());
+    }
+
+    #[test]
+    fn mission_writes_respect_the_history_gate_but_reads_stay_available() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({});
+        let mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        storage.set_history_writes(false);
+        assert!(matches!(
+            storage.create_mission(mission_draft(&constraints)),
+            Err(StorageError::HistoryDisabled)
+        ));
+        assert!(matches!(
+            storage.add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Blocked",
+                    objective: "Should not persist.",
+                    provider_id: None,
+                    model: None,
+                },
+            ),
+            Err(StorageError::HistoryDisabled)
+        ));
+        assert!(storage.load_mission(mission).unwrap().is_some());
+        assert_eq!(storage.list_missions(10).unwrap().len(), 1);
+        storage.set_history_writes(true);
+        storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Allowed",
+                    objective: "Persists now.",
+                    provider_id: None,
+                    model: None,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn mission_inputs_and_limits_are_validated() {
+        let storage = Storage::open_in_memory().unwrap();
+        let array = serde_json::json!([]);
+        assert!(matches!(
+            storage.create_mission(NewMission {
+                title: " ",
+                objective: "x",
+                constraints: &array,
+                workspace: "",
+            }),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert!(matches!(
+            storage.create_mission(NewMission {
+                title: "Title",
+                objective: "x",
+                constraints: &array,
+                workspace: "",
+            }),
+            Err(StorageError::InvalidMission(_))
+        ));
+        let constraints = serde_json::json!({});
+        let mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        for index in 0..3 {
+            storage
+                .add_mission_task(
+                    mission,
+                    NewMissionTask {
+                        title: &format!("Task {index}"),
+                        objective: "Objective",
+                        provider_id: None,
+                        model: None,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            storage.list_mission_tasks(mission, 10_000).unwrap().len(),
+            3
+        );
+        assert_eq!(storage.list_missions(10_000).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn version_one_database_upgrades_to_the_mission_schema() {
+        let dir =
+            std::env::temp_dir().join(format!("nexus-mission-migration-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nexus.db");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+        let constraints = serde_json::json!({});
+        let mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        assert_eq!(storage.load_mission(mission).unwrap().unwrap().id, mission);
+        let version: i64 = storage
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        drop(storage);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

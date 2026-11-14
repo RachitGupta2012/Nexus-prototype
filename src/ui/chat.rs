@@ -98,6 +98,14 @@ impl ChatScreen {
         outcome
     }
 
+    #[cfg(test)]
+    pub(crate) fn selected_id(&self) -> Option<i64> {
+        self.controller
+            .conversation
+            .as_ref()
+            .map(|conversation| conversation.id)
+    }
+
     pub fn window_title(&self) -> Option<String> {
         let conversation = self.controller.conversation.as_ref()?;
         let title = conversation.title.trim();
@@ -185,7 +193,14 @@ impl ChatScreen {
                 .hint_text("Search conversations")
                 .desired_width(f32::INFINITY)
                 .char_limit(MAX_SEARCH_CHARS),
-        );
+        )
+        .widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::accesskit::Role::TextInput,
+                true,
+                "Search conversations",
+            )
+        });
         ui.separator();
 
         let now = unix_time_now();
@@ -245,10 +260,26 @@ impl ChatScreen {
                                     .desired_width(150.0)
                                     .char_limit(200),
                             );
-                            if ui.small_button("✓").clicked() {
+                            let confirm = ui.small_button("✓");
+                            confirm.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::accesskit::Role::Button,
+                                    true,
+                                    "Save new title",
+                                )
+                            });
+                            if confirm.clicked() {
                                 finish_rename = Some((summary.id, buffer.clone()));
                             }
-                            if ui.small_button("×").clicked() {
+                            let cancel = ui.small_button("×");
+                            cancel.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::accesskit::Role::Button,
+                                    true,
+                                    "Cancel rename",
+                                )
+                            });
+                            if cancel.clicked() {
                                 finish_rename = Some((summary.id, String::new()));
                             }
                             if response.lost_focus()
@@ -267,11 +298,16 @@ impl ChatScreen {
                                 open_id = Some(summary.id);
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui
-                                    .small_button("×")
-                                    .on_hover_text("Delete conversation")
-                                    .clicked()
-                                {
+                                let delete =
+                                    ui.small_button("×").on_hover_text("Delete conversation");
+                                delete.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::accesskit::Role::Button,
+                                        true,
+                                        format!("Delete {}", summary.title),
+                                    )
+                                });
+                                if delete.clicked() {
                                     delete_id = Some(summary.id);
                                 }
                                 if summary.id > 0
@@ -281,9 +317,18 @@ impl ChatScreen {
                                             .conversation
                                             .as_ref()
                                             .is_some_and(|c| c.id == summary.id))
-                                    && ui.small_button("✎").on_hover_text("Rename").clicked()
                                 {
-                                    start_rename = Some((summary.id, summary.title.clone()));
+                                    let rename = ui.small_button("Rename").on_hover_text("Rename");
+                                    rename.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::accesskit::Role::Button,
+                                            true,
+                                            format!("Rename {}", summary.title),
+                                        )
+                                    });
+                                    if rename.clicked() {
+                                        start_rename = Some((summary.id, summary.title.clone()));
+                                    }
                                 }
                             });
                         });
@@ -468,14 +513,14 @@ impl ChatScreen {
         }
 
         ui.horizontal_wrapped(|ui| {
-            ui.label("Provider");
+            let provider_label = ui.label("Provider");
             let selected_name = self
                 .provider_id
                 .and_then(|id| config.provider(id))
                 .map(|provider| provider.name.clone())
                 .unwrap_or_else(|| "None".to_owned());
             let mut provider_changed = false;
-            egui::ComboBox::from_id_salt("chat_provider")
+            let provider_combo = egui::ComboBox::from_id_salt("chat_provider")
                 .selected_text(selected_name)
                 .width(160.0)
                 .show_ui(ui, |ui| {
@@ -492,6 +537,7 @@ impl ChatScreen {
                         }
                     }
                 });
+            provider_combo.response.labelled_by(provider_label.id);
             if provider_changed {
                 self.model = self
                     .provider_id
@@ -500,12 +546,13 @@ impl ChatScreen {
                     .unwrap_or_default();
             }
             ui.separator();
-            ui.label("Model");
-            ui.add(
+            let model_label = ui.label("Model");
+            let model_field = ui.add(
                 TextEdit::singleline(&mut self.model)
                     .desired_width(190.0)
                     .hint_text("model id"),
             );
+            model_field.labelled_by(model_label.id);
             if let Some(provider) = self.provider_id.and_then(|id| config.provider(id))
                 && !provider.models.is_empty()
             {

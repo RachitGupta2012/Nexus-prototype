@@ -54,6 +54,13 @@
 - Support timeouts, cancellation, output limits, and capability negotiation.
 - Never claim automatic model switching if an external harness does not expose it.
 
+### MCP read-only client foundation (implemented)
+
+- Users add, edit, enable/disable, and remove STDIO or Streamable HTTP server entries.
+- Connection is explicit; protocol negotiation, identity, capabilities, and bounded tool metadata are displayed through the official `rmcp` client.
+- Tools are marked discovered but not executable. There is no `tools/call`, resource read, prompt retrieval, auto-connect, or reconnect.
+- Remaining MCP work: tool-call approval loop, resource/prompt browsing, and MCP server mode. These stay in Phase 5/6 and are not part of this foundation.
+
 ### Provider connector foundation (implemented incrementally)
 
 - The current app includes a user-configured OpenAI-compatible Chat Completions connection and macOS Keychain storage for a manually supplied API key.
@@ -71,6 +78,12 @@
 **Exit criteria:** history-off leaves no conversation-linked rows and nothing returns after restart; search is bounded and deterministic; usage views stay bounded; formatting, Clippy with `-D warnings`, tests, and the release build pass.
 
 ## Phase 5 — mission engine
+
+### Mission persistence foundation (implemented)
+
+- SQLite schema v2 for missions, ordered tasks, task attempts, checkpoints, and approval records.
+- Closed status-transition tables, cascade deletion, history-write gating, and bounded reads/writes.
+- No mission UI, decomposition, scheduling, provider/tool execution, or approval enforcement. These remain next.
 
 - Task schema: objective, constraints, workspace, budget, privacy, deliverables.
 - Manual Master Agent selection and automatic selection.

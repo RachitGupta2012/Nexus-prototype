@@ -1,101 +1,285 @@
-# Integration and adapter policy
+# Provider adapters
 
-## Supported integration families
+NEXUS talks to documented HTTP APIs. It does not launch agent processes, install
+models, scan the network, or implement the Mission Engine.
 
-- ACP: agent-client protocol integrations where an official, maintained implementation is available.
-- MCP: tool and context integrations using documented protocol behavior.
-- Direct provider APIs: model catalogs and inference only where official APIs support them.
-- Native CLI adapters: documented command-line interfaces with stable, testable behavior.
+## Protocol status
 
-## Adapter contract
+| Protocol | Send chat | Test connection | Fetch models | Notes |
+| --- | --- | --- | --- | --- |
+| `open_ai_chat` | Implemented | Implemented | `GET /models` | OpenAI and OpenAI-compatible gateways |
+| `ollama_chat` | Implemented | Implemented | `GET /api/tags` | Native Ollama chat API, NDJSON streaming |
+| `anthropic_messages` | Implemented | Implemented | `GET /models` | Native Messages API, SSE streaming, cursor pagination |
+| `gemini_generate_content` | Implemented | Implemented | `GET /models` | Native Generate Content, SSE streaming, page tokens |
+| `open_ai_responses` | Implemented | Implemented | `GET /models` | Native Responses API, named SSE events |
 
-Each adapter should declare:
+All configured protocols in this build are implemented. No fake success is
+returned anywhere in the provider layer.
 
-- Integration identity and version.
-- Whether it is installed, running, authenticated, connectable, and usable.
-- Supported operations and capability limitations.
-- Whether model selection is supported.
-- Authentication method without exposing credential material.
-- Timeout, cancellation, and output-limit behavior.
-- Evidence source and last verification time.
+## Connectivity semantics
 
-## Phase 2 discovery candidates
+**Test connection** validates the endpoint first, then performs one model-list
+request with an 8-second timeout and no redirects. It never generates tokens.
 
-The bounded catalog currently contains these agent harnesses/agent CLIs and exact executable basenames:
+The report distinguishes:
 
-| Candidate | Executable | Classification and evidence |
-|---|---|---|
-| Codex CLI | `codex` | Agent harness; vendor documentation is recorded as documentation evidence. |
-| Claude Code | `claude` | Agent harness; vendor CLI documentation is recorded as documentation evidence. |
-| OpenCode | `opencode` | Agent harness; CLI docs describe interactive and print modes and ACP serving. |
-| Pi coding agent | `pi` | Agent harness candidate; `pi` is a generic basename, so a match is always marked ambiguous. |
-| Gemini CLI | `gemini` | Google Gemini CLI, documented as an open-source terminal agent. It is only a detected executable, not a provider connection. |
-| GitHub Copilot CLI | `copilot` | GitHub's terminal-native coding assistant with agentic capabilities. |
-| Aider | `aider` | Coding-assistant harness documented to accept source files and make edits. |
-| Amp CLI | `amp` | Amp's coding-agent CLI; `amp` is a generic basename, so matches are always marked ambiguous. |
-| Goose CLI | `goose` | Goose's documented general-purpose AI agent CLI. |
+- URL validation passed (before any request).
+- Server reachable (an HTTP response was received).
+- Authentication accepted or rejected (`401`/`403`), or not required.
+- Model list responded and parsed.
 
-The catalog does not include model providers, API gateways, model aggregators, or ordinary developer tools. For example, OpenRouter is a provider/gateway and belongs in a later provider registry. Candidate identity references are linked from each record's Documentation field. The catalog interfaces are documentation claims, not verified capabilities of the installed version. No candidate is claimed running, authenticated, connectable, usable, or controllable.
+A successful probe means the endpoint and credentials work for model listing. It
+does **not** prove inference works, and the UI says so. Connectivity findings are
+not stored as capability evidence or permission to execute anything.
 
-## Discovery roots
+Failures are reported without echoing response bodies, headers, or keys:
 
-Standard Discovery is the default and is explicitly started by the user. It checks exact candidate names directly in eligible PATH entries and these conventional macOS roots. A root is checked once even if it appears in PATH and in the catalog.
+| Condition | Report |
+| --- | --- |
+| Invalid scheme/credentials in URL, remote HTTP, no-key remote endpoint | configuration error before the request |
+| DNS, connection, or TLS failure | server unreachable |
+| Timeout | no answer within 8 seconds |
+| `401`/`403` | authentication rejected |
+| Other HTTP status | server answered with that status; path/credentials may be wrong |
+| Body not in the expected shape | server responded, model list was not in the expected format |
 
-| macOS root | Why included |
-|---|---|
-| `/opt/homebrew/bin` (containment: `/opt/homebrew`) | Conventional Apple Silicon Homebrew executable directory. |
-| `/usr/local/bin` (containment: `/usr/local`) | Conventional Intel Homebrew and local CLI directory; may also be used on Apple Silicon. |
-| `/usr/bin` (containment: `/usr`) | macOS system PATH executable directory. |
-| `~/bin` | Common user-level CLI location. |
-| `~/.local/bin` | XDG-style user CLI location. |
-| `~/.cargo/bin` | Cargo-installed executables. |
-| `~/.npm/bin`, `~/.npm-global/bin` | Common npm user-global binary directories; NEXUS does not query npm for a configured prefix. |
-| `~/.bun/bin` | Bun-installed executables. |
-| `~/.volta/bin` | Volta shims. |
-| `~/.asdf/shims`, `~/.local/share/mise/shims` | asdf and mise command shims. |
-| `~/.yarn/bin` | Yarn user-level executable directory. |
-| `~/.local/share/pnpm`, `~/Library/pnpm` | Common pnpm global executable directories. |
-| `~/.linuxbrew/bin` | Home-directory Homebrew layout. |
-| PATH entries inside `/opt/homebrew`, `/usr/local`, `/usr`, or eligible user-managed roots including `~/.nvm`, `~/.fnm`, and the listed shims | Captures version-manager layouts such as `~/.nvm/versions/.../bin` without invoking managers or traversing those trees. |
+## Model discovery
 
-PATH input is capped at 16 KiB and 64 entries. Relative PATH entries and directories outside those allowlisted roots are skipped with a reason. Missing roots are recorded as missing, unsafe/symlinked roots as skipped, and permission failures as inaccessible. `~/Documents`, `~/Downloads`, `~/Desktop`, `~/Pictures`, `~/Library` generally, `/System`, `/Network`, `/Volumes`, and `/net` are not standard search roots. npm/Homebrew/package-manager commands are never executed to discover prefixes. PATH values can name an otherwise unconventional directory; that directory is checked only when it is within the documented eligible roots.
+**Fetch models** is supported for `open_ai_chat`, `open_ai_responses`,
+`ollama_chat`, `anthropic_messages`, and `gemini_generate_content`.
 
-This list is intentionally non-exhaustive. Custom installations outside these roots require an optional custom search location or may not be detected.
+- Base URLs are joined as-is; prefixes and trailing slashes are preserved.
+- `/v1` is never duplicated. `https://host/v1` → `https://host/v1/models`;
+  `https://host/gateway/v1` → `https://host/gateway/v1/models`.
+- Anthropic uses cursor pagination (`limit`, `after_id`, `has_more`, `last_id`).
+- Gemini uses page-token pagination (`pageSize`, `pageToken`, `nextPageToken`).
+  Only models whose `supportedGenerationMethods` contains `generateContent` are
+  offered.
+- Both paginated listings are bounded to five pages and 2,000 models. The
+  OpenAI-compatible, OpenAI Responses, and Ollama listings return a single list;
+  the published OpenAI `/models` endpoint has no page cursor. That list does not
+  expose which models support the Responses API, so NEXUS makes no compatibility
+  claim beyond the provider accepting the request.
+- Responses are bounded by the provider module's size limits.
+- Discovered models are staged in the UI. Existing catalog entries and prices
+  are kept; only checked, new model IDs are appended, and nothing is written to
+  disk until the user saves the configuration.
+- Model files are never downloaded or installed.
 
-## Expanded System Discovery
+## OpenAI Responses adapter
 
-Expanded Discovery is an explicit setting with a consent dialog that names its roots before scan. It adds bounded recursive name/metadata checks under `/Applications`, `/opt`, and `~/Applications`. It excludes system-protected areas, Library and configuration/data subtrees, credentials-related folder names, personal documents/media/download folders, remote-volume paths, and directory symlinks. It is limited to depth 4, 128 directories, 3,000 entries, and 10 seconds; it runs on a cancelable worker and reports progress. Scope approval is stored with a scope version; a material scope change requires new approval. Declining leaves Standard Discovery available and does not trigger automatic repeat prompts.
+Verified against OpenAI's published Responses create and streaming-event
+references.
 
-Expanded Discovery is not a full-disk scan and does not guarantee discovery. It may miss unusual installs. It does not inspect file contents, agent config, authentication, Keychain, process lists, or credentials. It makes no network requests and never executes any tool.
+- Endpoint: `POST {base_url}/responses` (default base `https://api.openai.com/v1`).
+- Authentication: `Authorization: Bearer` (existing `Bearer` auth mode). The key
+  remains in the Keychain.
+- Request body:
+  - `model`, `stream: true`, and an explicit `store: false`. NEXUS does not
+    retrieve stored responses, so provider-side retention is not requested.
+  - `input` is the Responses array of `{role, content}` messages. User messages
+    map to `user`, assistant messages to `assistant`; order and meaningful text
+    are preserved.
+  - System prompt and stored system messages map to top-level `instructions`,
+    never to an input role or Chat Completions `messages`.
+  - Empty text blocks are skipped safely. Consecutive same-role turns are kept
+    as they are rather than merged or given invented turns.
+  - `temperature` is optional (0–2). `max_output_tokens` is sent only when
+    configured (1–1,000,000).
+  - Chat Completions fields (`messages`, `max_tokens`, `system`) are never sent.
+  - Tool definitions, assistant tool calls, and tool-result messages are
+    rejected with a configuration error.
+- Streaming uses named SSE events; each `data` JSON also carries `type`:
+  - `response.output_text.delta` → assistant text.
+  - `response.refusal.delta` → text plus a refusal outcome; `response.refusal.done`
+    also marks the refusal.
+  - `response.reasoning_summary_text.delta` and `response.reasoning_text.delta`
+    → reasoning events, never assistant text.
+  - `response.output_item.added/done`, `response.content_part.added/done`,
+    `response.output_text.done`, `response.refusal.done`, reasoning done/part
+    events, and unknown events are not appended as text, avoiding duplicated
+    output.
+  - `response.completed` → completed, unless status/refusal says otherwise.
+  - `response.incomplete` → `max_output_tokens` maps to a visible token-limit
+    notice; `content_filter` maps to blocked; other reasons map to incomplete.
+  - `response.failed` and `error` fail with a sanitized request error.
+  - A stream without a terminal event emits an incomplete outcome.
+- Unsupported output: a tool-call or other non-text output item fails with
+  `UnsupportedOperation` instead of being discarded and marked complete.
+- Usage comes from the terminal `response.usage`: input, output, and cached
+  input tokens.
+- HTTP status mapping: `400` → invalid request, `401` → authentication rejected,
+  `403` → permission denied, `404` → model not found, `429` → rate limited,
+  other statuses → `HttpStatus`. Response bodies are never read or echoed.
+- Cancellation uses the shared provider watch channel.
+- Documentation:
+  <https://developers.openai.com/api/reference/resources/responses/methods/create>
+  and <https://developers.openai.com/api/reference/resources/responses/streaming-events>.
 
-## Custom search locations
+## Anthropic Messages adapter
 
-On macOS, the native folder picker lets the user add up to 16 custom directories. NEXUS validates an existing absolute real directory, rejects symbolic-link path components and known/identified remote or unrecognized filesystems, then persists the path in its own registry. A custom location authorizes only passive exact-name checks directly inside that directory; there is no recursion. Remove excludes the path from later scans. This does not grant execution or control permission.
+Verified against Anthropic's published API and Python SDK type definitions.
 
-Do not assume an integration is available or supports a feature until verified against its current documented interface. Version checks are a separate user-run operation, not part of discovery.
+- Endpoint: `POST {base_url}/messages` (default base `https://api.anthropic.com/v1`).
+- Headers: `x-api-key` (existing `XApiKey` auth mode) and the required
+  `anthropic-version: 2023-06-01`. No `Authorization` header is sent.
+- Request body:
+  - `model`, required `max_tokens`, `messages`, `stream: true`.
+  - `system` is a top-level string, never a message role. Stored system messages
+    are appended there instead of being dropped.
+  - `max_tokens` defaults to 4,096 when the UI has no value; explicit values must
+    be 1–1,000,000. The API still enforces per-model limits.
+  - `temperature` is optional and must be 0–1.
+  - Empty user/assistant text blocks are skipped safely; message order is kept.
+  - Tool definitions, assistant tool calls, and tool-result messages are
+    rejected with a clear configuration error rather than silently discarded.
+    Anthropic tool execution is not implemented.
+- Streaming (`text/event-stream`) parses named SSE events and trusts the JSON
+  `type` field:
+  - `message_start` — input and cache-read usage.
+  - `content_block_start` — text/thinking block preamble.
+  - `content_block_delta` — `text_delta` → text, `thinking_delta` → reasoning;
+    `signature_delta`, `input_json_delta`, and citations do not become text.
+  - `content_block_stop` — ignored.
+  - `message_delta` — cumulative output-token usage.
+  - `message_stop` — final event with usage.
+  - `ping` and unknown event types are ignored.
+  - `error` fails the stream without echoing its message.
+  - A stream that ends without `message_stop` still emits a final event and keeps
+    received text.
+  - Malformed JSON fails with `InvalidResponse`.
+- HTTP status mapping (no response body is read or displayed): `400`/`413`/`422`
+  → invalid request, `401` → authentication rejected, `403` → permission denied,
+  `404` → model not found, `429` → rate limited, other statuses → `HttpStatus`.
+- Cancellation uses the shared provider watch channel.
+- Model listing: `GET {base_url}/models` with `anthropic-version`, `limit=1000`,
+  and `after_id` while `has_more` is true.
 
-OmniRush and any other proprietary or less-documented tool must remain unintegrated until a supported interface is confirmed.
+## Gemini Generate Content adapter
 
-## Model selection truthfulness
+Verified against the published Gemini API reference and model-list schema
+(`developers.google.com` / `ai.google.dev`; API version `v1beta`).
 
-If an external harness exposes model selection, NEXUS may use it. If it does not, NEXUS may recommend a model but must not claim to have switched it. Never reverse-engineer private APIs or bypass service restrictions.
+- Endpoints:
+  - `POST {base_url}/models/{model}:streamGenerateContent?alt=sse`
+  - Model listing: `GET {base_url}/models`
+  - Default base URL: `https://generativelanguage.googleapis.com/v1beta`.
+- Authentication: `x-goog-api-key` (existing `XGoogApiKey` mode). No
+  `Authorization` header is sent.
+- Request body:
+  - `contents` is an ordered list. User messages become role `user`; assistant
+    messages become role `model`.
+  - System text is a top-level `systemInstruction.parts` list. Stored system
+    messages are appended there, never sent as a `contents` role.
+  - Empty text blocks are skipped safely; meaningful text and order are kept.
+  - Consecutive same-role turns are preserved as-is rather than silently merged
+    or given invented turns. The API may reject them, and that error is surfaced.
+  - `generationConfig.temperature` is optional (0–2). `maxOutputTokens` is sent
+    only when configured and must be 1–1,000,000; otherwise the model default is
+    used.
+  - The model is carried only in the URL path, never in the body. OpenAI- and
+    Anthropic-specific fields (`model`, `stream`, `max_tokens`, top-level
+    `system`) are not sent.
+  - Tool definitions, assistant tool calls, and tool-result messages are
+    rejected with a configuration error. Gemini tool execution is not
+    implemented.
+- Streaming (`text/event-stream`, `alt=sse`) reads one `GenerateContentResponse`
+  JSON object per SSE `data` value:
+  - Text arrives in `candidates[].content.parts[].text`.
+  - Parts with `thought: true` become reasoning events, never assistant text.
+  - Empty candidates and unknown part fields are ignored safely.
+  - Arbitrary chunk boundaries, several SSE events per chunk, CRLF, and
+    malformed JSON are handled by the shared incremental SSE decoder.
+  - Usage is read from cumulative `usageMetadata`: prompt, candidate, and cached
+    content token counts.
+  - `promptFeedback.blockReason` and candidate finish reasons are classified
+    separately from normal completion.
+- Finish reasons:
+  - `STOP` → completed.
+  - `MAX_TOKENS` → completed with a visible "may be incomplete" notice.
+  - `SAFETY`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `IMAGE_SAFETY` →
+    blocked; the partial text, if any, is stored with `Failed` status and a
+    sanitized error is shown.
+  - `RECITATION` → recitation-blocked with its own message.
+  - `OTHER`, `LANGUAGE`, tool-call failures, unknown values, and streams with no
+    finish reason → incomplete; never reported as a normal answer.
+- HTTP status mapping (response bodies are never read or echoed): `400` →
+  invalid request, `401` → authentication rejected, `403` → permission denied,
+  `404` → model not found, `429` → rate limited, other statuses → `HttpStatus`.
+  An SSE `error` object fails with a sanitized request error.
+- Cancellation uses the shared provider watch channel.
+- Model discovery: page size 1,000, follows `nextPageToken` for at most five
+  pages/2,000 models, uses `baseModelId` (falling back to `name` without
+  `models/`), and excludes models that do not declare `generateContent`.
 
-## Phase 3 capability evidence and routing
+## Ollama adapter
 
-`capability.rs` provides typed capability identifiers and a small curated catalog separate from discovery records. The initial claims are vendor-documented software-development workflows for the nine existing harness candidates. They do not claim individual file operations, research, data analysis, document processing, writing, structured output, or tool-use support. Capability is never inferred from executable presence.
+`ollama_chat` targets the native `POST /api/chat` endpoint, not an
+OpenAI-compatible shim.
 
-Evidence states are Verified, Documented, User-reported, Inferred, Unsupported, and Unknown. The source, evidence state/method, optional version, review date, concise claim, and limitation are retained. The current catalog contains documentation claims only. Routing may treat recent documented claims as tentative, but only exact version-matched Verified claims can produce Supported. A missing version is explicitly version-unverified; evidence older than 365 days, undated, future-dated, for another version, or in conflict cannot establish eligibility. The date cutoff is a simple deterministic freshness rule, not a claim that vendor behavior changes on a schedule.
+- Request body: `{model, messages, stream: true, options}` where `options`
+  contains `temperature` and/or `num_predict` when configured.
+- Messages map `system`, `user`, and `assistant` roles. Tool messages and
+  assistant tool calls are not sent; Ollama tool support is not implemented.
+- Responses are newline-delimited JSON, not SSE:
+  - `{"message":{"content":"..."}}` emits text deltas.
+  - `{"message":{"thinking":"..."}}` emits reasoning deltas.
+  - `{"done":true,"prompt_eval_count":N,"eval_count":M}` emits the final event
+    with usage.
+  - A stream that ends without `done` still emits a final event and keeps the
+    text received so far.
+  - Malformed JSON fails the stream with a sanitized error.
+  - HTTP `404` maps to "the provider does not have this model available".
+- Chunk boundaries are irrelevant: multiple events per chunk and events split
+  across chunks are handled by an incremental decoder.
+- Cancellation uses the existing provider watch channel.
+- Only the explicitly configured Ollama endpoint is contacted. NEXUS never runs
+  shell commands, installs Ollama, or downloads models.
 
-Routing accepts a typed task, immutable discovered-record snapshot, catalog, and explicit timestamp. It ranks deterministically without arbitrary scores, preserves semantic ties, and reports unknown requirements rather than treating them as passing. Manual selection is session-only and changes no evidence or registry state. This feature does not execute agents or authorize execution.
+Typical endpoint: `http://127.0.0.1:11434` with authentication mode `none`.
+Plain HTTP is allowed only for loopback; a remote Ollama endpoint must use HTTPS
+and an allowed authentication mode.
 
-## Supported macOS application bundles
+## Architecture
 
-Each explicit agent rescan also checks the exact bundle paths `DeepAI Code.app` and `OpenCode.app` directly under `/Applications` and `~/Applications`. This check is nonrecursive, bounded to two roots and two names, and reads filesystem metadata only. It does not inspect `Info.plist`, application contents, configuration, credentials, or running processes. The current list is curated and non-exhaustive. A found application is displayed separately from a detected CLI and is not claimed controllable or usable by NEXUS.
+- `src/provider/mod.rs` — protocols, settings validation, endpoint construction,
+  error types, background `ProviderController`.
+- `src/provider/http.rs` — one HTTP client path (timeouts, no redirects, auth
+  headers, bounded GET and streaming helpers).
+- `src/provider/openai_chat.rs` — SSE adapter.
+- `src/provider/ollama_chat.rs` — NDJSON adapter.
+- `src/provider/gemini_generate_content.rs` — native Generate Content SSE adapter.
+- `src/provider/openai_responses.rs` — native Responses API named-event adapter.
+- `src/provider/probe.rs` — connectivity probes and model discovery, run on a
+  worker thread.
+- `src/ui/providers.rs` — profile editor, Test connection / Fetch models, staged
+  model review, Keychain key management.
 
-## Explicit API provider connector
+Provider networking never runs inside UI painting code, and the UI never handles
+raw credentials.
 
-The initial provider client supports OpenAI-compatible Chat Completions endpoints, including compatible gateways such as FreeLLMAPI. Configure a base URL and model identifier (a gateway may document a selector such as `auto`). NEXUS sends `{model, messages, stream:false}` and reads the first text choice. This protocol is not universal: native Anthropic Messages, Gemini `generateContent`, and other distinct provider APIs are not supported by this connector. Provider adapters should be added only against official documented APIs, with protocol-specific authentication, limits, error handling, and tests; do not claim universal market coverage.
+## Limitations
 
-The user enters a provider-issued API key and explicitly saves or removes it. On macOS it is stored in Keychain under the configured endpoint origin, so changing hosts does not reuse the old host's key. The value is read only when the user explicitly submits a task. Remote endpoints require HTTPS; loopback HTTP is allowed for local gateways. The request does not follow redirects, has a 120-second total timeout, and reads at most 2 MiB of response data. Task content is not logged or persisted by this connector. No key is searched for or imported.
+- MCP client support is read-only: explicit connection, protocol negotiation, capability display, and bounded tool discovery. Tool execution, resource reads, prompt retrieval, ACP integration, and the mission runner are absent.
+- No streaming cancellation control in the chat UI beyond dropping the
+  controller.
+- Model listing does not verify that a model can generate output.
+- Automated tests use loopback mock servers and fixed payloads; live provider
+  requests are manual and billable. Gemini was not exercised against the live API.
+- Gemini may answer an invalid key with HTTP `400` rather than `401`; NEXUS
+  reports that as an invalid request because it never reads error bodies.
 
-This is a model response connection, not an agent harness. It does not read a workspace, write files, run commands, or execute a discovered CLI. It does not claim the provider selected a particular upstream model beyond the configured identifier. Agent execution and workspace operations require separately designed adapters and explicit authorization.
+## Manual Ollama verification
+
+With Ollama running locally and a model already installed (NEXUS does not install
+either):
+
+```sh
+NEXUS_OLLAMA_MODEL=llama3.2 \
+  cargo test --workspace live_ollama -- --ignored --nocapture
+```
+
+Or use the Providers screen: Test connection, Fetch models, select a model, save,
+then send a message. Unavailable-model handling can be checked by selecting a
+model that is not installed; the failure is reported as an HTTP 404/model-not-found
+error.

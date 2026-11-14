@@ -107,33 +107,72 @@ impl SseDecoder {
     }
 }
 
-pub async fn post_sse(
-    settings: &ProviderSettings,
-    api_key: Option<&str>,
-    body: &serde_json::Value,
-    cancel: &mut watch::Receiver<bool>,
-    mut on_event: impl FnMut(SseEvent) -> Result<(), ProviderError>,
-) -> Result<(), ProviderError> {
-    let url = settings.endpoint()?;
-    let headers = super::auth_headers(settings, api_key)?;
-    let client = reqwest::Client::builder()
+fn client() -> Result<reqwest::Client, ProviderError> {
+    reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(TOTAL_TIMEOUT)
         .redirect(Policy::none())
         .user_agent(format!("NEXUS/{}", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|_| ProviderError::RequestFailed)?;
-    let mut request = client
-        .post(url)
-        .header("Accept", "text/event-stream")
-        .json(body);
-    for (name, value) in headers {
+        .map_err(|_| ProviderError::RequestFailed)
+}
+
+fn authorize(
+    mut request: reqwest::RequestBuilder,
+    settings: &ProviderSettings,
+    api_key: Option<&str>,
+) -> Result<reqwest::RequestBuilder, ProviderError> {
+    for (name, value) in super::auth_headers(settings, api_key)? {
         request = request.header(name, value);
     }
-    let response = request
+    Ok(request)
+}
+
+fn map_send_error(error: reqwest::Error) -> ProviderError {
+    if error.is_timeout() {
+        ProviderError::Timeout
+    } else {
+        ProviderError::RequestFailed
+    }
+}
+
+/// Sends a JSON POST and forwards raw response chunks as they arrive. The
+/// caller owns framing (SSE or newline-delimited JSON).
+pub async fn post_stream(
+    url: url::Url,
+    settings: &ProviderSettings,
+    api_key: Option<&str>,
+    body: &serde_json::Value,
+    accept: &str,
+    cancel: &mut watch::Receiver<bool>,
+    on_chunk: impl FnMut(&[u8]) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
+    post_stream_with_headers(url, settings, api_key, body, accept, &[], cancel, on_chunk).await
+}
+
+/// Same as [`post_stream`] plus protocol-required request headers (for example
+/// Anthropic's `anthropic-version`). Authentication headers always come from
+/// the existing credential abstraction.
+#[allow(clippy::too_many_arguments)]
+pub async fn post_stream_with_headers(
+    url: url::Url,
+    settings: &ProviderSettings,
+    api_key: Option<&str>,
+    body: &serde_json::Value,
+    accept: &str,
+    extra_headers: &[(&str, &str)],
+    cancel: &mut watch::Receiver<bool>,
+    mut on_chunk: impl FnMut(&[u8]) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
+    let client = client()?;
+    let mut request = client.post(url).header("Accept", accept).json(body);
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
+    let response = authorize(request, settings, api_key)?
         .send()
         .await
-        .map_err(|_| ProviderError::RequestFailed)?;
+        .map_err(map_send_error)?;
     let status = response.status();
     if !status.is_success() {
         return Err(ProviderError::HttpStatus(status.as_u16()));
@@ -145,7 +184,6 @@ pub async fn post_sse(
         return Err(ProviderError::ResponseTooLarge);
     }
 
-    let mut decoder = SseDecoder::default();
     let mut stream = response.bytes_stream();
     let started = Instant::now();
     loop {
@@ -171,14 +209,95 @@ pub async fn post_sse(
                 }
             }
         };
-        for event in decoder.push(&next)? {
-            on_event(event)?;
-        }
+        on_chunk(&next)?;
     }
+    Ok(())
+}
+
+pub async fn post_sse(
+    settings: &ProviderSettings,
+    api_key: Option<&str>,
+    body: &serde_json::Value,
+    cancel: &mut watch::Receiver<bool>,
+    on_event: impl FnMut(SseEvent) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
+    post_sse_with_headers(settings, api_key, body, &[], cancel, on_event).await
+}
+
+/// Same as [`post_sse`] plus protocol-required request headers.
+pub async fn post_sse_with_headers(
+    settings: &ProviderSettings,
+    api_key: Option<&str>,
+    body: &serde_json::Value,
+    extra_headers: &[(&str, &str)],
+    cancel: &mut watch::Receiver<bool>,
+    mut on_event: impl FnMut(SseEvent) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
+    let url = settings.endpoint()?;
+    let mut decoder = SseDecoder::default();
+    post_stream_with_headers(
+        url,
+        settings,
+        api_key,
+        body,
+        "text/event-stream",
+        extra_headers,
+        cancel,
+        |chunk| {
+            for event in decoder.push(chunk)? {
+                on_event(event)?;
+            }
+            Ok(())
+        },
+    )
+    .await?;
     for event in decoder.finish()? {
         on_event(event)?;
     }
     Ok(())
+}
+
+/// GET a JSON endpoint with a short timeout. Returns the status and a bounded
+/// body; non-success statuses are returned rather than converted to errors so
+/// callers can report authentication and reachability separately.
+/// GET a JSON endpoint with a short timeout and protocol-required headers.
+/// Returns the status and a bounded body; non-success statuses are returned
+/// rather than converted to errors so callers can report authentication and
+/// reachability separately.
+pub async fn get_json_with_headers(
+    url: url::Url,
+    settings: &ProviderSettings,
+    api_key: Option<&str>,
+    timeout: std::time::Duration,
+    extra_headers: &[(&str, &str)],
+) -> Result<(u16, Vec<u8>), ProviderError> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        .redirect(Policy::none())
+        .user_agent(format!("NEXUS/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|_| ProviderError::RequestFailed)?;
+    let mut request = client.get(url).header("Accept", "application/json");
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
+    let response = authorize(request, settings, api_key)?
+        .send()
+        .await
+        .map_err(map_send_error)?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(ProviderError::ResponseTooLarge);
+    }
+    let status = response.status().as_u16();
+    let body = response.bytes().await.map_err(map_send_error)?;
+    if body.len() > MAX_RESPONSE_BYTES {
+        return Err(ProviderError::ResponseTooLarge);
+    }
+    Ok((status, body.to_vec()))
 }
 
 #[cfg(test)]

@@ -2,17 +2,17 @@ mod chat;
 mod config;
 mod credentials;
 mod error;
+pub mod mcp;
+pub mod mission;
 mod provider;
-mod storage;
+pub mod storage;
 #[cfg(feature = "telemetry")]
 mod telemetry;
 mod ui;
 
 use std::path::PathBuf;
 
-use config::Config;
 use error::AppError;
-use storage::Storage;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), AppError> {
@@ -24,10 +24,8 @@ fn main() -> Result<(), AppError> {
     );
 
     let config_path = app_support_path("config.toml")?;
-    let config = Config::load_or_default(&config_path)?;
     let database_path = app_support_path("nexus.db")?;
-    let storage = Storage::open(&database_path)?;
-    ui::run(config, config_path, database_path, storage)?;
+    ui::run(config_path, database_path)?;
     Ok(())
 }
 

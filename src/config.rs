@@ -96,8 +96,12 @@ impl Protocol {
     }
 
     pub const fn supports_tools(self) -> bool {
-        // Adapters may still reject a specific model's schema.
-        true
+        // Anthropic, Gemini, and OpenAI Responses tool use are not implemented
+        // in this build; tool content is rejected rather than reshaped.
+        !matches!(
+            self,
+            Self::AnthropicMessages | Self::GeminiGenerateContent | Self::OpenAiResponses
+        )
     }
 }
 
@@ -254,6 +258,9 @@ pub struct McpServerConfig {
     pub bearer_auth: bool,
     #[serde(default)]
     pub enabled_tools: Vec<String>,
+    /// Disabled servers keep their settings but cannot be connected.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -292,12 +299,12 @@ pub struct Config {
     pub legacy_welcome_message: Option<String>,
 }
 
-fn default_config_version() -> u32 {
-    CONFIG_VERSION
-}
-
 fn default_true() -> bool {
     true
+}
+
+fn default_config_version() -> u32 {
+    CONFIG_VERSION
 }
 
 fn default_retention_days() -> u32 {
@@ -540,6 +547,20 @@ impl Config {
         self.default_provider_id
             .and_then(|id| self.provider(id))
             .or_else(|| self.providers.first())
+    }
+
+    pub fn allocate_mcp_id(&mut self) -> u64 {
+        self.mcp_sequence = self
+            .mcp_sequence
+            .max(
+                self.mcp_servers
+                    .iter()
+                    .map(|server| server.id)
+                    .max()
+                    .unwrap_or(0),
+            )
+            .saturating_add(1);
+        self.mcp_sequence
     }
 
     pub fn allocate_provider_id(&mut self) -> u64 {
@@ -824,6 +845,7 @@ mod tests {
             url: String::new(),
             bearer_auth: false,
             enabled_tools: Vec::new(),
+            enabled: true,
         });
         let path = std::env::temp_dir().join(format!(
             "nexus-config-{}-mcp/config.toml",

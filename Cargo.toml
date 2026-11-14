@@ -28,6 +28,10 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 futures-util = "0.3"
 rusqlite = { version = "0.42", features = ["bundled"] }
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
+rmcp = { version = "3.10", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["snapshot", "wgpu"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "4.2", default-features = false, features = ["v1"] }

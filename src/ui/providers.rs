@@ -7,7 +7,8 @@ use url::Url;
 
 use crate::config::{AuthMode, Config, ModelConfig, ModelPricing, Protocol, ProviderProfile};
 use crate::credentials;
-use crate::provider::ProviderSettings;
+use crate::provider::probe::{ProbeEvent, ProbeKind, ProbeTask};
+use crate::provider::{ProviderError, ProviderSettings};
 
 const LIST_WIDTH: f32 = 230.0;
 
@@ -102,6 +103,25 @@ pub struct ProvidersScreen {
     delete_request: Option<u64>,
     default_request: Option<u64>,
     status: Option<String>,
+    probe: Option<ProbeTask>,
+    probe_kind: Option<ProbeKind>,
+    is_discovering: bool,
+    probe_status: Option<ProbeStatus>,
+    discovered: Vec<DiscoveredModel>,
+    #[cfg(test)]
+    force_probe_running: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ProbeStatus {
+    ok: bool,
+    message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiscoveredModel {
+    id: String,
+    selected: bool,
 }
 
 impl ProvidersScreen {
@@ -114,11 +134,39 @@ impl ProvidersScreen {
             delete_request: None,
             default_request: None,
             status: None,
+            probe: None,
+            probe_kind: None,
+            is_discovering: false,
+            probe_status: None,
+            discovered: Vec::new(),
+            #[cfg(test)]
+            force_probe_running: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_probe_state_for_test(&mut self, status: Option<(bool, &str)>, running: bool) {
+        self.force_probe_running = running;
+        self.probe_status = status.map(|(ok, message)| ProbeStatus {
+            ok,
+            message: message.to_owned(),
+        });
+    }
+
+    fn probe_running(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.force_probe_running || self.probe.is_some()
+        }
+        #[cfg(not(test))]
+        {
+            self.probe.is_some()
         }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, config: &mut Config, config_path: &Path) {
         self.sync_selection(config);
+        self.poll_probe(ui.ctx(), config);
         let height = ui.available_height();
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(
@@ -140,6 +188,73 @@ impl ProvidersScreen {
         });
 
         self.apply_requests(ui, config);
+    }
+
+    fn poll_probe(&mut self, ctx: &egui::Context, config: &Config) {
+        let Some(task) = self.probe.as_mut() else {
+            return;
+        };
+        if let Some(event) = task.poll() {
+            self.probe = None;
+            self.probe_kind = None;
+            self.is_discovering = false;
+            match event {
+                ProbeEvent::Connection(Ok(report)) => {
+                    self.probe_status = Some(ProbeStatus {
+                        ok: report.reachable && report.model_list_parsed,
+                        message: report.summary,
+                    });
+                }
+                ProbeEvent::Connection(Err(error)) => {
+                    self.probe_status = Some(ProbeStatus {
+                        ok: false,
+                        message: probe_error_message(&error),
+                    });
+                }
+                ProbeEvent::Models(Ok(ids)) => {
+                    let known = self
+                        .selected
+                        .and_then(|id| config.provider(id))
+                        .map(|provider| {
+                            provider
+                                .models
+                                .iter()
+                                .map(|model| model.id.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if ids.is_empty() {
+                        self.probe_status = Some(ProbeStatus {
+                            ok: true,
+                            message: "The server reported no models. Nothing was changed."
+                                .to_owned(),
+                        });
+                    } else {
+                        self.discovered = ids
+                            .into_iter()
+                            .map(|id| DiscoveredModel {
+                                selected: !known.contains(&id),
+                                id,
+                            })
+                            .collect();
+                        self.probe_status = Some(ProbeStatus {
+                            ok: true,
+                            message: "Models discovered. Review them below; nothing is saved yet."
+                                .to_owned(),
+                        });
+                    }
+                }
+                ProbeEvent::Models(Err(error)) => {
+                    self.probe_status = Some(ProbeStatus {
+                        ok: false,
+                        message: probe_error_message(&error),
+                    });
+                }
+            }
+        }
+        if self.probe.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
     }
 
     fn sync_selection(&mut self, config: &Config) {
@@ -229,6 +344,7 @@ impl ProvidersScreen {
     }
 
     fn editor(&mut self, ui: &mut egui::Ui, config: &mut Config, config_path: &Path) {
+        self.show_discovery(ui, config);
         let Some(id) = self.selected else {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
@@ -254,10 +370,14 @@ impl ProvidersScreen {
         let mut make_default = false;
         if let Some(provider) = config.provider_mut(id) {
             ui.horizontal(|ui| {
-                ui.add(
-                    TextEdit::singleline(&mut provider.name)
-                        .desired_width(220.0)
-                        .font(egui::TextStyle::Heading),
+                a11y(
+                    ui.add(
+                        TextEdit::singleline(&mut provider.name)
+                            .desired_width(220.0)
+                            .font(egui::TextStyle::Heading),
+                    ),
+                    egui::accesskit::Role::TextInput,
+                    "Provider name".to_owned(),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     delete = ui.button("Delete").clicked();
@@ -280,8 +400,8 @@ impl ProvidersScreen {
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("Protocol");
-                    egui::ComboBox::from_id_salt("provider_protocol")
+                    let protocol_label = ui.label("Protocol");
+                    let protocol_combo = egui::ComboBox::from_id_salt("provider_protocol")
                         .selected_text(provider.protocol.label())
                         .width(260.0)
                         .show_ui(ui, |ui| {
@@ -293,18 +413,20 @@ impl ProvidersScreen {
                                 );
                             }
                         });
+                    protocol_combo.response.labelled_by(protocol_label.id);
                     ui.end_row();
 
-                    ui.label("Base URL");
-                    ui.add(
+                    let base_url_label = ui.label("Base URL");
+                    let base_url_field = ui.add(
                         TextEdit::singleline(&mut provider.base_url)
                             .desired_width(f32::INFINITY)
                             .hint_text("https://api.example.com/v1"),
                     );
+                    base_url_field.labelled_by(base_url_label.id);
                     ui.end_row();
 
-                    ui.label("Authentication");
-                    egui::ComboBox::from_id_salt("provider_auth")
+                    let auth_label = ui.label("Authentication");
+                    let auth_combo = egui::ComboBox::from_id_salt("provider_auth")
                         .selected_text(provider.auth.label())
                         .width(260.0)
                         .show_ui(ui, |ui| {
@@ -312,14 +434,16 @@ impl ProvidersScreen {
                                 ui.selectable_value(&mut provider.auth, *auth, auth.label());
                             }
                         });
+                    auth_combo.response.labelled_by(auth_label.id);
                     ui.end_row();
 
-                    ui.label("Default model");
-                    ui.add(
+                    let default_model_label = ui.label("Default model");
+                    let default_model_field = ui.add(
                         TextEdit::singleline(&mut provider.default_model)
                             .desired_width(f32::INFINITY)
                             .hint_text("model id"),
                     );
+                    default_model_field.labelled_by(default_model_label.id);
                     ui.end_row();
                 });
 
@@ -362,6 +486,9 @@ impl ProvidersScreen {
                 }
             }
 
+            ui.add_space(6.0);
+            self.connectivity_section(ui, provider);
+
             ui.add_space(10.0);
             self.key_section(ui, provider);
 
@@ -380,75 +507,129 @@ impl ProvidersScreen {
 
             let mut remove_model = None;
             for (index, model) in provider.models.iter_mut().enumerate() {
+                let row = index + 1;
+                let key = if model.id.trim().is_empty() {
+                    format!("model {row}")
+                } else {
+                    format!("model {row} ({})", model.id.trim())
+                };
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.label("ID");
-                        ui.add(TextEdit::singleline(&mut model.id).desired_width(180.0));
+                        labelled_text_edit(ui, &mut model.id, 180.0, format!("Model ID for {key}"));
                         ui.label("Name");
-                        ui.add(TextEdit::singleline(&mut model.display_name).desired_width(160.0));
+                        labelled_text_edit(
+                            ui,
+                            &mut model.display_name,
+                            160.0,
+                            format!("Display name for {key}"),
+                        );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("×").on_hover_text("Remove model").clicked() {
+                            let remove = a11y(
+                                ui.small_button("×").on_hover_text("Remove model"),
+                                egui::accesskit::Role::Button,
+                                format!("Remove {key} from the catalog"),
+                            );
+                            if remove.clicked() {
                                 remove_model = Some(index);
                             }
                         });
                     });
                     ui.horizontal(|ui| {
                         let mut has_context = model.context_window.is_some();
-                        if ui.checkbox(&mut has_context, "context").changed() {
+                        let context_toggle = a11y(
+                            ui.checkbox(&mut has_context, "context"),
+                            egui::accesskit::Role::CheckBox,
+                            format!("Track context window for {key}"),
+                        );
+                        if context_toggle.changed() {
                             model.context_window = has_context.then_some(8_192);
                         }
                         if let Some(context) = &mut model.context_window {
-                            ui.add(
-                                egui::DragValue::new(context)
-                                    .speed(256.0)
-                                    .range(0..=100_000_000),
+                            a11y(
+                                ui.add(
+                                    egui::DragValue::new(context)
+                                        .speed(256.0)
+                                        .range(0..=100_000_000),
+                                ),
+                                egui::accesskit::Role::SpinButton,
+                                format!("Context window tokens for {key}"),
                             );
                         }
 
                         let mut supports_tools = model.supports_tools.unwrap_or(false);
-                        if ui
-                            .add_enabled(
+                        let tools_toggle = a11y(
+                            ui.add_enabled(
                                 tools_supported,
                                 egui::Checkbox::new(&mut supports_tools, "tools"),
                             )
                             .on_disabled_hover_text(
                                 "This provider protocol has no tool-call support in this build.",
-                            )
-                            .changed()
-                        {
+                            ),
+                            egui::accesskit::Role::CheckBox,
+                            format!("Declare tool support for {key}"),
+                        );
+                        if tools_toggle.changed() {
                             model.supports_tools = Some(supports_tools);
                         }
 
                         let mut has_pricing = model.pricing.is_some();
-                        if ui.checkbox(&mut has_pricing, "pricing").changed() {
+                        let pricing_toggle = a11y(
+                            ui.checkbox(&mut has_pricing, "pricing"),
+                            egui::accesskit::Role::CheckBox,
+                            format!("Track pricing for {key}"),
+                        );
+                        if pricing_toggle.changed() {
                             model.pricing = has_pricing.then(default_pricing);
                         }
                         if let Some(pricing) = &mut model.pricing {
-                            ui.add(
-                                egui::DragValue::new(&mut pricing.input_per_mtok)
-                                    .speed(0.01)
-                                    .prefix("$")
-                                    .suffix(" in/M"),
+                            a11y(
+                                ui.add(
+                                    egui::DragValue::new(&mut pricing.input_per_mtok)
+                                        .speed(0.01)
+                                        .prefix("$")
+                                        .suffix(" in/M"),
+                                ),
+                                egui::accesskit::Role::SpinButton,
+                                format!("Input price per million tokens for {key}"),
                             );
-                            ui.add(
-                                egui::DragValue::new(&mut pricing.output_per_mtok)
-                                    .speed(0.01)
-                                    .prefix("$")
-                                    .suffix(" out/M"),
+                            a11y(
+                                ui.add(
+                                    egui::DragValue::new(&mut pricing.output_per_mtok)
+                                        .speed(0.01)
+                                        .prefix("$")
+                                        .suffix(" out/M"),
+                                ),
+                                egui::accesskit::Role::SpinButton,
+                                format!("Output price per million tokens for {key}"),
                             );
                             let mut has_cached = pricing.cached_input_per_mtok.is_some();
-                            if ui.checkbox(&mut has_cached, "cached").changed() {
+                            let cached_toggle = a11y(
+                                ui.checkbox(&mut has_cached, "cached"),
+                                egui::accesskit::Role::CheckBox,
+                                format!("Track cached-input pricing for {key}"),
+                            );
+                            if cached_toggle.changed() {
                                 pricing.cached_input_per_mtok = has_cached.then_some(0.0);
                             }
                             if let Some(cached) = &mut pricing.cached_input_per_mtok {
-                                ui.add(
-                                    egui::DragValue::new(cached)
-                                        .speed(0.01)
-                                        .prefix("$")
-                                        .suffix(" cached/M"),
+                                a11y(
+                                    ui.add(
+                                        egui::DragValue::new(cached)
+                                            .speed(0.01)
+                                            .prefix("$")
+                                            .suffix(" cached/M"),
+                                    ),
+                                    egui::accesskit::Role::SpinButton,
+                                    format!("Cached-input price per million tokens for {key}"),
                                 );
                             }
-                            ui.add(TextEdit::singleline(&mut pricing.currency).desired_width(44.0));
+                            labelled_text_edit(
+                                ui,
+                                &mut pricing.currency,
+                                44.0,
+                                format!("Currency for {key}"),
+                            );
                         }
                     });
                 });
@@ -485,6 +666,129 @@ impl ProvidersScreen {
         }
         if make_default {
             self.default_request = Some(id);
+        }
+    }
+
+    fn connectivity_section(&mut self, ui: &mut egui::Ui, provider: &ProviderProfile) {
+        let running = self.probe_running();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!running, egui::Button::new("Test connection"))
+                .on_hover_text(
+                    "Validates the URL and asks the provider for its model list. No tokens are generated.",
+                )
+                .clicked()
+            {
+                self.start_probe(provider, ProbeKind::Connection);
+            }
+            if ui
+                .add_enabled(!running, egui::Button::new("Fetch models"))
+                .on_hover_text("Lists models for review. Nothing is saved until you save the profile.")
+                .clicked()
+            {
+                self.start_probe(provider, ProbeKind::Models);
+            }
+            if running {
+                ui.small("Contacting the provider…");
+            }
+        });
+        if let Some(status) = &self.probe_status {
+            let text = RichText::new(&status.message);
+            if status.ok {
+                ui.colored_label(egui::Color32::from_rgb(0x3d, 0x9a, 0x5f), text);
+            } else {
+                ui.colored_label(ui.visuals().warn_fg_color, text);
+            }
+        }
+    }
+
+    fn start_probe(&mut self, provider: &ProviderProfile, kind: ProbeKind) {
+        self.probe_status = None;
+        self.discovered.clear();
+        self.is_discovering = kind == ProbeKind::Models;
+        let model = if provider.default_model.trim().is_empty() {
+            "auto"
+        } else {
+            provider.default_model.trim()
+        };
+        let settings = ProviderSettings {
+            profile_id: provider.id,
+            protocol: provider.protocol,
+            base_url: provider.base_url.clone(),
+            auth: provider.auth,
+            model: model.to_owned(),
+        };
+        let api_key = if provider.auth == AuthMode::None {
+            None
+        } else {
+            account_for(provider).and_then(|account| credentials::load(&account).ok().flatten())
+        };
+        match ProbeTask::start(kind, settings, api_key) {
+            Ok(task) => {
+                self.probe = Some(task);
+                self.probe_kind = Some(kind);
+            }
+            Err(error) => {
+                self.is_discovering = false;
+                self.probe_status = Some(ProbeStatus {
+                    ok: false,
+                    message: probe_error_message(&error),
+                });
+            }
+        }
+    }
+
+    fn show_discovery(&mut self, ui: &mut egui::Ui, config: &mut Config) {
+        if self.discovered.is_empty() {
+            return;
+        }
+        let mut apply = false;
+        let mut discard = false;
+        ui.group(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} models discovered",
+                    self.discovered.len()
+                ))
+                .strong(),
+            );
+            ui.small("Existing catalog entries are kept. Nothing is saved until you save the configuration.");
+            egui::ScrollArea::vertical()
+                .id_salt("discovered_models")
+                .max_height(160.0)
+                .show(ui, |ui| {
+                    for model in &mut self.discovered {
+                        ui.add(egui::Checkbox::new(&mut model.selected, &model.id));
+                    }
+                });
+            ui.horizontal(|ui| {
+                apply = ui
+                    .add_enabled(
+                        self.discovered.iter().any(|model| model.selected),
+                        egui::Button::new("Add selected models"),
+                    )
+                    .clicked();
+                discard = ui.button("Discard").clicked();
+            });
+        });
+        if discard {
+            self.discovered.clear();
+            self.probe_status = None;
+        }
+        if apply {
+            let ids: Vec<String> = self
+                .discovered
+                .iter()
+                .filter(|model| model.selected)
+                .map(|model| model.id.clone())
+                .collect();
+            if let Some(provider) = self.selected.and_then(|id| config.provider_mut(id)) {
+                let added = add_selected_models(provider, &ids);
+                self.status = Some(format!(
+                    "Added {added} models to the catalog. Save the configuration to keep them."
+                ));
+            }
+            self.discovered.clear();
         }
     }
 
@@ -528,11 +832,15 @@ impl ProvidersScreen {
         });
 
         ui.horizontal(|ui| {
-            ui.add(
-                TextEdit::singleline(&mut self.key_input)
-                    .password(true)
-                    .desired_width(260.0)
-                    .hint_text("Paste API key"),
+            a11y(
+                ui.add(
+                    TextEdit::singleline(&mut self.key_input)
+                        .password(true)
+                        .desired_width(260.0)
+                        .hint_text("Paste API key"),
+                ),
+                egui::accesskit::Role::TextInput,
+                format!("New API key for {}", provider.name),
             );
             if ui
                 .add_enabled(
@@ -631,6 +939,80 @@ fn account_for(provider: &ProviderProfile) -> Option<String> {
     ))
 }
 
+fn add_selected_models(provider: &mut ProviderProfile, ids: &[String]) -> usize {
+    let before = provider.models.len();
+    for id in ids {
+        provider.ensure_model(id);
+    }
+    provider.models.len().saturating_sub(before)
+}
+
+fn labelled_text_edit(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    width: f32,
+    label: String,
+) -> egui::Response {
+    a11y(
+        ui.add(TextEdit::singleline(value).desired_width(width)),
+        egui::accesskit::Role::TextInput,
+        label,
+    )
+}
+
+/// Attaches an accessibility name to an existing widget response.
+fn a11y(response: egui::Response, role: egui::accesskit::Role, label: String) -> egui::Response {
+    let enabled = response.enabled();
+    response.widget_info(|| egui::WidgetInfo::labeled(role, enabled, &label));
+    response
+}
+
+fn probe_error_message(error: &ProviderError) -> String {
+    match error {
+        ProviderError::UnsupportedProtocol => {
+            "This protocol has no connectivity check in this build.".to_owned()
+        }
+        ProviderError::AuthenticationRejected => {
+            "The provider rejected the saved API key (HTTP 401).".to_owned()
+        }
+        ProviderError::PermissionDenied => {
+            "The provider denied access. Check the API key permissions (HTTP 403).".to_owned()
+        }
+        ProviderError::InvalidRequest => "The provider rejected the request as invalid.".to_owned(),
+        ProviderError::RateLimited => {
+            "The provider rate limit was reached. Retry later.".to_owned()
+        }
+        ProviderError::InvalidBaseUrl => {
+            "The base URL is invalid or not allowed. Use HTTPS, or HTTP on loopback.".to_owned()
+        }
+        ProviderError::InvalidConfig(detail) => {
+            format!("The provider configuration is invalid: {detail}")
+        }
+        ProviderError::Timeout => "The server did not answer in time.".to_owned(),
+        ProviderError::RequestFailed => {
+            "Could not reach the server (DNS, connection, or TLS failure).".to_owned()
+        }
+        ProviderError::HttpStatus(code) => {
+            format!("The server answered HTTP {code}. Check the endpoint path and credentials.")
+        }
+        ProviderError::InvalidResponse => {
+            "The server answered, but the response could not be parsed.".to_owned()
+        }
+        ProviderError::ResponseTooLarge => "The server response was too large.".to_owned(),
+        ProviderError::MissingKey => {
+            "No API key is saved for this provider. Add one in the API key section.".to_owned()
+        }
+        ProviderError::UnsupportedOperation(_) => {
+            "The response used a provider feature that this build does not support.".to_owned()
+        }
+        ProviderError::InvalidModel => "Set a default model before saving this profile.".to_owned(),
+        ProviderError::Cancelled => "The request was cancelled.".to_owned(),
+        ProviderError::ModelNotFound => {
+            "The provider does not have this model available.".to_owned()
+        }
+    }
+}
+
 fn default_pricing() -> ModelPricing {
     ModelPricing {
         input_per_mtok: 0.0,
@@ -689,6 +1071,105 @@ mod tests {
                 model: profile.default_model.clone(),
             };
             assert!(settings.validate().is_ok(), "{} is invalid", preset.name);
+        }
+    }
+
+    #[test]
+    fn discovered_models_are_merged_without_replacing_the_catalog() {
+        let mut profile = ProviderProfile::new(
+            1,
+            "Local",
+            Protocol::OpenAiChat,
+            "https://api.example.com/v1",
+            AuthMode::Bearer,
+            "auto",
+        );
+        profile.models[0].pricing = Some(ModelPricing {
+            input_per_mtok: 1.5,
+            output_per_mtok: 2.5,
+            cached_input_per_mtok: Some(0.5),
+            currency: "USD".to_owned(),
+            reviewed_at_unix_secs: Some(42),
+        });
+        let added = add_selected_models(
+            &mut profile,
+            &[
+                "auto".to_owned(),
+                "new-model".to_owned(),
+                "new-model".to_owned(),
+            ],
+        );
+        assert_eq!(added, 1);
+        assert_eq!(profile.models.len(), 2);
+        assert_eq!(profile.models[0].id, "auto");
+        assert_eq!(
+            profile.models[0].pricing.as_ref().unwrap().input_per_mtok,
+            1.5
+        );
+        assert_eq!(profile.models[1].id, "new-model");
+    }
+
+    #[test]
+    fn probe_errors_are_sanitized() {
+        let messages = [
+            ProbeErrorCase::Unsupported,
+            ProbeErrorCase::Auth,
+            ProbeErrorCase::Url,
+            ProbeErrorCase::Timeout,
+            ProbeErrorCase::Network,
+            ProbeErrorCase::Server,
+            ProbeErrorCase::Malformed,
+            ProbeErrorCase::TooLarge,
+            ProbeErrorCase::MissingKey,
+            ProbeErrorCase::Model,
+            ProbeErrorCase::Cancelled,
+            ProbeErrorCase::Permission,
+            ProbeErrorCase::Invalid,
+            ProbeErrorCase::RateLimited,
+        ];
+        for case in messages {
+            let text = probe_error_message(&case.error());
+            assert!(!text.contains("sk-"), "{text}");
+            assert!(!text.contains("secret"), "{text}");
+            assert!(!text.contains("http://"), "{text}");
+        }
+    }
+
+    enum ProbeErrorCase {
+        Unsupported,
+        Auth,
+        Url,
+        Timeout,
+        Network,
+        Server,
+        Malformed,
+        TooLarge,
+        MissingKey,
+        Model,
+        Cancelled,
+        Permission,
+        Invalid,
+        RateLimited,
+    }
+
+    impl ProbeErrorCase {
+        fn error(&self) -> ProviderError {
+            match self {
+                Self::Unsupported => ProviderError::UnsupportedProtocol,
+                Self::Auth => ProviderError::AuthenticationRejected,
+                Self::Url => ProviderError::InvalidBaseUrl,
+                Self::Timeout => ProviderError::Timeout,
+                Self::Network => ProviderError::RequestFailed,
+                Self::Server => ProviderError::HttpStatus(500),
+                Self::Malformed => ProviderError::InvalidResponse,
+                Self::TooLarge => ProviderError::ResponseTooLarge,
+                Self::MissingKey => ProviderError::MissingKey,
+                Self::Model => ProviderError::ModelNotFound,
+                Self::Cancelled => ProviderError::Cancelled,
+                Self::Permission => ProviderError::PermissionDenied,
+                Self::Invalid => ProviderError::InvalidRequest,
+                Self::RateLimited => ProviderError::RateLimited,
+            }
         }
     }
 
