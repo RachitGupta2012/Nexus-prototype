@@ -77,6 +77,16 @@ An explicit discovery scan checks only the exact `DeepAI Code.app` and `OpenCode
 - Clearing history deletes conversations, messages, and conversation-linked usage. It does not delete provider profiles, Keychain credentials, application settings, or the configuration file.
 - Theme, retention, and history preferences are stored in the TOML configuration; provider keys never are. Data-location copy buttons expose paths only, never credential contents.
 
+## Mission Control boundary
+
+- The Missions section can create and edit mission definitions and unstarted task definitions. It exposes no approve, deny, start, pause, cancel, or execute control.
+- Definition writes require history to be enabled. Mission definitions are editable only in `draft` or `planned`; task edits and removal require a `pending` task with no attempts, checkpoints, or approvals. Execution rows are never updated by a definition change.
+- Dependency writes are validated at the storage boundary for self-references, duplicates, missing/cross-mission IDs, the 100-dependency limit, and direct or indirect cycles. A failed validation leaves the previous dependency list unchanged.
+- Task removal strips the removed ID from dependent tasks and compacts ordinals in one transaction. Mission deletion requires explicit confirmation because it deletes tasks and execution history.
+- Approvals are displayed as pending records with an explicit informational notice. No UI action or background task consumes an approval to grant execution.
+- Mission reads are bounded to 200 missions, 1,000 tasks, 200 attempts, 200 checkpoints, 200 status events, and 200 pending approvals. The UI says when a list is truncated.
+- A failed read leaves the last successful data visible with a generic error; raw database errors are not shown. Mission data is local SQLite content and is never sent over the network.
+
 ## Configuration recovery
 
 - When `config.toml` cannot be read or parsed, NEXUS never replaces it silently and never exits with the parser's raw message, which can quote file content.

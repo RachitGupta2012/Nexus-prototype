@@ -19,6 +19,7 @@ pub const MAX_TASKS: u32 = 1_000;
 pub const MAX_ATTEMPTS: u32 = 200;
 pub const MAX_CHECKPOINTS: u32 = 200;
 pub const MAX_APPROVALS: u32 = 200;
+pub const MAX_STATUS_EVENTS: u32 = 200;
 
 /// Storage caps independent of list size.
 pub const MAX_TASKS_PER_MISSION: u32 = 1_000;
@@ -35,6 +36,9 @@ pub const MAX_LABEL_BYTES: usize = 200;
 pub const MAX_SUMMARY_BYTES: usize = 2_000;
 pub const MAX_NOTE_BYTES: usize = 4_096;
 pub const MAX_ERROR_BYTES: usize = 4_096;
+pub const MAX_DELIVERABLES: usize = 100;
+pub const MAX_DELIVERABLE_BYTES: usize = 1_000;
+pub const MAX_DEPENDENCIES: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MissionStatus {
@@ -301,6 +305,30 @@ impl ApprovalStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MissionPrivacy {
+    #[default]
+    LocalOnly,
+    RemoteAllowed,
+}
+
+impl MissionPrivacy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalOnly => "local_only",
+            Self::RemoteAllowed => "remote_allowed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "local_only" => Self::LocalOnly,
+            "remote_allowed" => Self::RemoteAllowed,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mission {
     pub id: MissionId,
@@ -308,6 +336,8 @@ pub struct Mission {
     pub objective: String,
     pub constraints: Value,
     pub workspace: String,
+    pub deliverables: Vec<String>,
+    pub privacy: MissionPrivacy,
     pub status: MissionStatus,
     pub created_at: u64,
     pub updated_at: u64,
@@ -331,6 +361,17 @@ pub struct NewMission<'a> {
     pub objective: &'a str,
     pub constraints: &'a Value,
     pub workspace: &'a str,
+    pub deliverables: &'a [String],
+    pub privacy: MissionPrivacy,
+}
+
+pub struct UpdateMission<'a> {
+    pub title: &'a str,
+    pub objective: &'a str,
+    pub constraints: &'a Value,
+    pub workspace: &'a str,
+    pub deliverables: &'a [String],
+    pub privacy: MissionPrivacy,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -343,6 +384,7 @@ pub struct MissionTask {
     pub status: TaskStatus,
     pub provider_id: Option<u64>,
     pub model: Option<String>,
+    pub depends_on: Vec<MissionTaskId>,
     pub created_at: u64,
     pub updated_at: u64,
     pub started_at: Option<u64>,
@@ -354,6 +396,12 @@ pub struct NewMissionTask<'a> {
     pub objective: &'a str,
     pub provider_id: Option<u64>,
     pub model: Option<&'a str>,
+    pub depends_on: &'a [MissionTaskId],
+}
+
+pub struct UpdateMissionTask<'a> {
+    pub title: &'a str,
+    pub objective: &'a str,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -365,6 +413,15 @@ pub struct TaskAttempt {
     pub error: Option<String>,
     pub started_at: u64,
     pub completed_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskStatusEvent {
+    pub id: i64,
+    pub task_id: MissionTaskId,
+    pub status: TaskStatus,
+    pub note: Option<String>,
+    pub created_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -434,6 +491,23 @@ pub fn validate_optional_text(
     Ok(())
 }
 
+/// Serializes and bounds a list of human-readable deliverables.
+pub fn deliverable_list(items: &[String], message: &'static str) -> Result<String, &'static str> {
+    if items.len() > MAX_DELIVERABLES {
+        return Err(message);
+    }
+    let mut normalized = Vec::with_capacity(items.len());
+    for item in items {
+        validate_text(item, MAX_DELIVERABLE_BYTES, message)?;
+        normalized.push(item.trim().to_owned());
+    }
+    let encoded = serde_json::to_string(&normalized).map_err(|_| message)?;
+    if encoded.len() > MAX_JSON_BYTES {
+        return Err(message);
+    }
+    Ok(encoded)
+}
+
 /// Serializes a JSON object after checking its encoded size.
 pub fn json_object(value: &Value, message: &'static str) -> Result<String, &'static str> {
     if !value.is_object() {
@@ -444,6 +518,52 @@ pub fn json_object(value: &Value, message: &'static str) -> Result<String, &'sta
         return Err(message);
     }
     Ok(encoded)
+}
+
+/// Validates a proposed dependency list against the tasks in one mission.
+pub fn validate_dependency_list(
+    task_id: MissionTaskId,
+    dependencies: &[MissionTaskId],
+    mission_tasks: &[MissionTaskId],
+) -> Result<(), &'static str> {
+    if dependencies.len() > MAX_DEPENDENCIES {
+        return Err("A task can have at most 100 dependencies.");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for dependency in dependencies {
+        if *dependency == task_id {
+            return Err("A task cannot depend on itself.");
+        }
+        if !seen.insert(*dependency) {
+            return Err("Dependencies must be unique.");
+        }
+        if !mission_tasks.contains(dependency) {
+            return Err("A dependency does not belong to this mission.");
+        }
+    }
+    Ok(())
+}
+
+/// Returns true when the proposed edges close a cycle back to `task_id`.
+pub fn creates_dependency_cycle(
+    task_id: MissionTaskId,
+    dependencies: &[MissionTaskId],
+    edges: &[(MissionTaskId, Vec<MissionTaskId>)],
+) -> bool {
+    let mut stack: Vec<_> = dependencies.to_vec();
+    let mut visited = std::collections::HashSet::new();
+    while let Some(current) = stack.pop() {
+        if current == task_id {
+            return true;
+        }
+        if !visited.insert(current) {
+            continue;
+        }
+        if let Some((_, next)) = edges.iter().find(|(id, _)| *id == current) {
+            stack.extend(next);
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -469,6 +589,48 @@ mod tests {
         assert!(!TaskStatus::Completed.can_transition_to(TaskStatus::Running));
         assert!(AttemptStatus::Succeeded.is_terminal());
         assert!(!AttemptStatus::Running.is_terminal());
+    }
+
+    #[test]
+    fn dependency_lists_reject_self_duplicates_missing_and_limits() {
+        assert!(validate_dependency_list(1, &[], &[1, 2]).is_ok());
+        assert_eq!(
+            validate_dependency_list(1, &[1], &[1, 2]),
+            Err("A task cannot depend on itself.")
+        );
+        assert_eq!(
+            validate_dependency_list(1, &[2, 2], &[1, 2]),
+            Err("Dependencies must be unique.")
+        );
+        assert_eq!(
+            validate_dependency_list(1, &[3], &[1, 2]),
+            Err("A dependency does not belong to this mission.")
+        );
+        let too_many: Vec<_> = (10..=10 + MAX_DEPENDENCIES as i64).collect();
+        assert_eq!(
+            validate_dependency_list(1, &too_many, &too_many),
+            Err("A task can have at most 100 dependencies.")
+        );
+    }
+
+    #[test]
+    fn dependency_cycles_are_detected_directly_and_indirectly() {
+        let edges = vec![(1, vec![2]), (2, vec![3]), (3, vec![])];
+        assert!(!creates_dependency_cycle(1, &[2], &edges));
+        assert!(!creates_dependency_cycle(1, &[3], &edges));
+        assert!(creates_dependency_cycle(2, &[1], &edges));
+        assert!(creates_dependency_cycle(3, &[1], &edges));
+        assert!(creates_dependency_cycle(3, &[2], &edges));
+        assert!(!creates_dependency_cycle(1, &[], &edges));
+    }
+
+    #[test]
+    fn privacy_round_trips_and_defaults_to_local_only() {
+        assert_eq!(MissionPrivacy::default(), MissionPrivacy::LocalOnly);
+        for privacy in [MissionPrivacy::LocalOnly, MissionPrivacy::RemoteAllowed] {
+            assert_eq!(MissionPrivacy::parse(privacy.as_str()), Some(privacy));
+        }
+        assert_eq!(MissionPrivacy::parse("public"), None);
     }
 
     #[test]

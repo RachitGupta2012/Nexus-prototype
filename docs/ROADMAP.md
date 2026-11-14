@@ -79,11 +79,14 @@
 
 ## Phase 5 — mission engine
 
-### Mission persistence foundation (implemented)
+### Mission definition and inspection (implemented)
 
-- SQLite schema v2 for missions, ordered tasks, task attempts, checkpoints, and approval records.
+- SQLite schema v4 for missions, privacy, deliverables, ordered tasks, dependencies, attempts, checkpoints, status history, and approval records.
 - Closed status-transition tables, cascade deletion, history-write gating, and bounded reads/writes.
-- No mission UI, decomposition, scheduling, provider/tool execution, or approval enforcement. These remain next.
+- Mission Control creates and edits mission definitions and task definitions, edits dependencies with cycle/limit checks, reorders tasks, and safely removes unstarted tasks with dependency cleanup.
+- Definition edits are locked after planning; execution history is never rewritten by an edit.
+- Mission overview, mission detail, task detail, and an informational approval queue with empty, deleted, error, and truncation states.
+- No decomposition, scheduling, status-transition UI, provider/tool execution, or approval enforcement. These remain next.
 
 - Task schema: objective, constraints, workspace, budget, privacy, deliverables.
 - Manual Master Agent selection and automatic selection.
@@ -95,10 +98,10 @@
 
 ## Phase 6 — Mission Control
 
-- Mission composer and task list.
+- Mission composer and editable task list.
 - Agent/model inventory.
-- Mission timeline and verified events.
-- Approval queue.
+- Mission timeline and verified, live events.
+- Actionable approval queue with enforcement.
 - Resource dashboard and integration settings.
 - Explain why a candidate was selected and show evidence provenance.
 

@@ -8,6 +8,7 @@ use crate::storage::{DEFAULT_MAX_CONVERSATIONS, Storage};
 
 mod chat;
 mod mcp;
+mod missions;
 mod providers;
 mod recovery;
 mod settings;
@@ -148,6 +149,7 @@ struct NexusApp {
     chat: chat::ChatScreen,
     providers: providers::ProvidersScreen,
     mcp: mcp::McpScreen,
+    missions: missions::MissionsScreen,
     settings: settings::SettingsScreen,
     usage: usage::UsageScreen,
     last_title: String,
@@ -160,6 +162,7 @@ enum Section {
     Chat,
     Providers,
     Mcp,
+    Missions,
     Usage,
     Resources,
     Settings,
@@ -173,6 +176,7 @@ impl NexusApp {
         let chat = chat::ChatScreen::new(&config, &storage);
         let providers = providers::ProvidersScreen::new(&config);
         let mcp = mcp::McpScreen::new(&config);
+        let missions = missions::MissionsScreen::new();
         Self {
             config,
             config_path,
@@ -183,6 +187,7 @@ impl NexusApp {
             chat,
             providers,
             mcp,
+            missions,
             settings: settings::SettingsScreen::new(),
             usage: usage::UsageScreen::new(),
             last_title: "NEXUS".to_owned(),
@@ -203,6 +208,7 @@ impl NexusApp {
         let chat = chat::ChatScreen::new(&config, &storage);
         let providers = providers::ProvidersScreen::new(&config);
         let mcp = mcp::McpScreen::new(&config);
+        let missions = missions::MissionsScreen::new();
         Self {
             config,
             config_path,
@@ -213,6 +219,7 @@ impl NexusApp {
             chat,
             providers,
             mcp,
+            missions,
             settings: settings::SettingsScreen::new(),
             usage: usage::UsageScreen::new(),
             last_title: "NEXUS".to_owned(),
@@ -260,6 +267,7 @@ impl NexusApp {
                     (Section::Chat, "Chat"),
                     (Section::Providers, "Providers"),
                     (Section::Mcp, "MCP"),
+                    (Section::Missions, "Missions"),
                     (Section::Usage, "Usage"),
                     (Section::Resources, "Resources"),
                     (Section::Settings, "Settings"),
@@ -291,6 +299,11 @@ impl NexusApp {
             Section::Providers => {
                 egui::CentralPanel::default().show(ui, |ui| {
                     self.providers.show(ui, &mut self.config, &self.config_path);
+                });
+            }
+            Section::Missions => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.missions.show(ui, &self.storage);
                 });
             }
             Section::Usage => {

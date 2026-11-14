@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,14 +14,16 @@ use crate::config::Protocol;
 use crate::mission::{
     Approval, ApprovalId, ApprovalKind, ApprovalStatus, AttemptId, AttemptStatus, Checkpoint,
     CheckpointId, CheckpointKind, MAX_APPROVALS, MAX_APPROVALS_PER_MISSION, MAX_ATTEMPTS,
-    MAX_ATTEMPTS_PER_TASK, MAX_CHECKPOINTS, MAX_CHECKPOINTS_PER_MISSION, MAX_MISSIONS,
-    MAX_MODEL_BYTES, MAX_NOTE_BYTES, MAX_OBJECTIVE_BYTES, MAX_SUMMARY_BYTES, MAX_TASKS,
-    MAX_TASKS_PER_MISSION, MAX_TITLE_BYTES, MAX_WORKSPACE_BYTES, Mission, MissionId, MissionStatus,
-    MissionSummary, MissionTask, MissionTaskId, NewApproval, NewCheckpoint, NewMission,
-    NewMissionTask, TaskAttempt, TaskStatus, json_object, validate_optional_text, validate_text,
+    MAX_ATTEMPTS_PER_TASK, MAX_CHECKPOINTS, MAX_CHECKPOINTS_PER_MISSION, MAX_DEPENDENCIES,
+    MAX_MISSIONS, MAX_MODEL_BYTES, MAX_NOTE_BYTES, MAX_OBJECTIVE_BYTES, MAX_STATUS_EVENTS,
+    MAX_SUMMARY_BYTES, MAX_TASKS, MAX_TASKS_PER_MISSION, MAX_TITLE_BYTES, MAX_WORKSPACE_BYTES,
+    Mission, MissionId, MissionPrivacy, MissionStatus, MissionSummary, MissionTask, MissionTaskId,
+    NewApproval, NewCheckpoint, NewMission, NewMissionTask, TaskAttempt, TaskStatus,
+    TaskStatusEvent, UpdateMission, UpdateMissionTask, creates_dependency_cycle, deliverable_list,
+    json_object, validate_dependency_list, validate_optional_text, validate_text,
 };
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 4;
 pub const DEFAULT_MAX_CONVERSATIONS: u32 = 500;
 
 #[derive(Debug, thiserror::Error)]
@@ -343,6 +345,40 @@ impl Storage {
                 CREATE INDEX idx_approvals_pending
                     ON approvals(status, requested_at);
                 PRAGMA user_version = 2;
+                COMMIT;
+                ",
+            )?;
+        }
+        if found < 3 {
+            self.connection.execute_batch(
+                "
+                BEGIN IMMEDIATE;
+                ALTER TABLE missions
+                    ADD COLUMN deliverables_json TEXT NOT NULL DEFAULT '[]';
+                ALTER TABLE mission_tasks
+                    ADD COLUMN depends_on_json TEXT NOT NULL DEFAULT '[]';
+                CREATE TABLE task_status_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL
+                        REFERENCES mission_tasks(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    note TEXT,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX idx_task_status_events_task
+                    ON task_status_events(task_id, id);
+                PRAGMA user_version = 3;
+                COMMIT;
+                ",
+            )?;
+        }
+        if found < 4 {
+            self.connection.execute_batch(
+                "
+                BEGIN IMMEDIATE;
+                ALTER TABLE missions
+                    ADD COLUMN privacy TEXT NOT NULL DEFAULT 'local_only';
+                PRAGMA user_version = 4;
                 COMMIT;
                 ",
             )?;
@@ -839,6 +875,54 @@ impl Storage {
     // Mission persistence (Phase 5 schema foundation)
     // ------------------------------------------------------------------
 
+    /// Snapshot tests need a stable clock; production code always records the
+    /// real time. This rewrites only the display timestamps of one mission.
+    #[cfg(test)]
+    pub(crate) fn pin_mission_clock_for_test(
+        &self,
+        mission_id: MissionId,
+        timestamp: u64,
+    ) -> Result<(), StorageError> {
+        let timestamp = i64::try_from(timestamp)
+            .map_err(|_| StorageError::InvalidMission("timestamp is out of range"))?;
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE missions
+             SET created_at = ?1, updated_at = ?2, started_at = ?3, completed_at = NULL
+             WHERE id = ?4",
+            params![timestamp, timestamp + 60, timestamp + 30, mission_id],
+        )?;
+        transaction.execute(
+            "UPDATE mission_tasks
+             SET created_at = ?1, updated_at = ?2, started_at = ?3,
+                 completed_at = CASE WHEN status = 'completed' THEN ?4 ELSE NULL END
+             WHERE mission_id = ?5",
+            params![
+                timestamp,
+                timestamp + 120,
+                timestamp + 60,
+                timestamp + 90,
+                mission_id
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE task_attempts
+             SET started_at = ?1, completed_at = ?2
+             WHERE task_id IN (SELECT id FROM mission_tasks WHERE mission_id = ?3)",
+            params![timestamp + 70, timestamp + 90, mission_id],
+        )?;
+        transaction.execute(
+            "UPDATE checkpoints SET created_at = ?1 WHERE mission_id = ?2",
+            params![timestamp + 100, mission_id],
+        )?;
+        transaction.execute(
+            "UPDATE approvals SET requested_at = ?1 WHERE mission_id = ?2",
+            params![timestamp + 110, mission_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn create_mission(&self, draft: NewMission<'_>) -> Result<MissionId, StorageError> {
         self.require_history_writes()?;
         validate_text(draft.title, MAX_TITLE_BYTES, "mission title is invalid")
@@ -854,16 +938,21 @@ impl Storage {
         }
         let constraints = json_object(draft.constraints, "mission constraints are invalid")
             .map_err(StorageError::InvalidMission)?;
+        let deliverables = deliverable_list(draft.deliverables, "mission deliverables are invalid")
+            .map_err(StorageError::InvalidMission)?;
         let now = unix_time_now() as i64;
         self.connection.execute(
             "INSERT INTO missions
-             (title, objective, constraints_json, workspace, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+             (title, objective, constraints_json, workspace, deliverables_json,
+              privacy, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
             params![
                 draft.title.trim(),
                 draft.objective.trim(),
                 constraints,
                 draft.workspace.trim(),
+                deliverables,
+                draft.privacy.as_str(),
                 MissionStatus::Draft.as_str(),
                 now,
             ],
@@ -903,25 +992,38 @@ impl Storage {
 
     pub fn load_mission(&self, id: MissionId) -> Result<Option<Mission>, StorageError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, title, objective, constraints_json, workspace, status,
-                    created_at, updated_at, started_at, completed_at
+            "SELECT id, title, objective, constraints_json, workspace, deliverables_json,
+                    privacy, status, created_at, updated_at, started_at, completed_at
              FROM missions WHERE id = ?1",
         )?;
         let mission = statement
             .query_row([id], |row| {
-                let status: String = row.get(5)?;
+                let status: String = row.get(7)?;
+                let privacy: String = row.get(6)?;
                 let constraints: String = row.get(3)?;
+                let deliverables: String = row.get(5)?;
                 Ok(Mission {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     objective: row.get(2)?,
                     constraints: parse_json_column(&constraints, 3)?,
                     workspace: row.get(4)?,
+                    deliverables: parse_string_array(&deliverables, 5)?,
+                    privacy: MissionPrivacy::parse(&privacy).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "unknown mission privacy",
+                            )),
+                        )
+                    })?,
                     status: parse_mission_status(&status)?,
-                    created_at: from_i64(row.get(6)?, "created_at")?,
-                    updated_at: from_i64(row.get(7)?, "updated_at")?,
-                    started_at: opt_timestamp(row.get(8)?),
-                    completed_at: opt_timestamp(row.get(9)?),
+                    created_at: from_i64(row.get(8)?, "created_at")?,
+                    updated_at: from_i64(row.get(9)?, "updated_at")?,
+                    started_at: opt_timestamp(row.get(10)?),
+                    completed_at: opt_timestamp(row.get(11)?),
                 })
             })
             .optional()?;
@@ -966,6 +1068,269 @@ impl Storage {
         Ok(())
     }
 
+    pub fn update_mission_definition(
+        &self,
+        id: MissionId,
+        draft: UpdateMission<'_>,
+    ) -> Result<(), StorageError> {
+        self.require_history_writes()?;
+        validate_text(draft.title, MAX_TITLE_BYTES, "mission title is invalid")
+            .map_err(StorageError::InvalidMission)?;
+        validate_text(
+            draft.objective,
+            MAX_OBJECTIVE_BYTES,
+            "mission objective is invalid",
+        )
+        .map_err(StorageError::InvalidMission)?;
+        if draft.workspace.len() > MAX_WORKSPACE_BYTES || draft.workspace.contains('\0') {
+            return Err(StorageError::InvalidMission("mission workspace is invalid"));
+        }
+        let constraints = json_object(draft.constraints, "mission constraints are invalid")
+            .map_err(StorageError::InvalidMission)?;
+        let deliverables = deliverable_list(draft.deliverables, "mission deliverables are invalid")
+            .map_err(StorageError::InvalidMission)?;
+        self.require_definition_editable(id)?;
+        let now = unix_time_now() as i64;
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE missions
+             SET title = ?1, objective = ?2, constraints_json = ?3, workspace = ?4,
+                 deliverables_json = ?5, privacy = ?6, updated_at = ?7
+             WHERE id = ?8",
+            params![
+                draft.title.trim(),
+                draft.objective.trim(),
+                constraints,
+                draft.workspace.trim(),
+                deliverables,
+                draft.privacy.as_str(),
+                now,
+                id,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn update_mission_task_definition(
+        &self,
+        id: MissionTaskId,
+        draft: UpdateMissionTask<'_>,
+    ) -> Result<(), StorageError> {
+        self.require_history_writes()?;
+        validate_text(draft.title, MAX_TITLE_BYTES, "task title is invalid")
+            .map_err(StorageError::InvalidMission)?;
+        validate_text(
+            draft.objective,
+            MAX_OBJECTIVE_BYTES,
+            "task objective is invalid",
+        )
+        .map_err(StorageError::InvalidMission)?;
+        let Some((mission_id, status)) = self.task_mission_and_status(id)? else {
+            return Err(StorageError::InvalidMission("task not found"));
+        };
+        self.require_definition_editable(mission_id)?;
+        if status != TaskStatus::Pending {
+            return Err(StorageError::InvalidMission(
+                "task definition is locked after it leaves pending",
+            ));
+        }
+        if self.task_execution_record_count(id)? > 0 {
+            return Err(StorageError::InvalidMission(
+                "task definition is locked after execution records exist",
+            ));
+        }
+        let now = unix_time_now() as i64;
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE mission_tasks SET title = ?1, objective = ?2, updated_at = ?3 WHERE id = ?4",
+            params![draft.title.trim(), draft.objective.trim(), now, id],
+        )?;
+        transaction.execute(
+            "UPDATE missions SET updated_at = ?1 WHERE id = ?2",
+            params![now, mission_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn update_mission_task_dependencies(
+        &self,
+        id: MissionTaskId,
+        dependencies: &[MissionTaskId],
+    ) -> Result<(), StorageError> {
+        self.require_history_writes()?;
+        let Some((mission_id, status)) = self.task_mission_and_status(id)? else {
+            return Err(StorageError::InvalidMission("task not found"));
+        };
+        self.require_definition_editable(mission_id)?;
+        if status != TaskStatus::Pending {
+            return Err(StorageError::InvalidMission(
+                "task dependencies are locked after it leaves pending",
+            ));
+        }
+        if self.task_execution_record_count(id)? > 0 {
+            return Err(StorageError::InvalidMission(
+                "task dependencies are locked after execution records exist",
+            ));
+        }
+        let now = unix_time_now() as i64;
+        let transaction = self.connection.unchecked_transaction()?;
+        let tasks = {
+            let mut statement = transaction
+                .prepare("SELECT id, depends_on_json FROM mission_tasks WHERE mission_id = ?1")?;
+            let rows = statement.query_map([mission_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut tasks = Vec::new();
+            for row in rows {
+                let (task_id, encoded) = row?;
+                tasks.push((task_id, parse_id_array(&encoded, 1)?));
+            }
+            tasks
+        };
+        let allowed: Vec<_> = tasks.iter().map(|(task_id, _)| *task_id).collect();
+        validate_dependency_list(id, dependencies, &allowed)
+            .map_err(StorageError::InvalidMission)?;
+        if creates_dependency_cycle(id, dependencies, &tasks) {
+            return Err(StorageError::InvalidMission(
+                "task dependencies would create a cycle",
+            ));
+        }
+        let encoded = serde_json::to_string(dependencies).map_err(StorageError::Json)?;
+        transaction.execute(
+            "UPDATE mission_tasks
+             SET depends_on_json = ?1, updated_at = ?2
+             WHERE id = ?3",
+            params![encoded, now, id],
+        )?;
+        transaction.execute(
+            "UPDATE missions SET updated_at = ?1 WHERE id = ?2",
+            params![now, mission_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn reorder_mission_tasks(
+        &self,
+        mission_id: MissionId,
+        ordered_ids: &[MissionTaskId],
+    ) -> Result<(), StorageError> {
+        self.require_history_writes()?;
+        self.require_definition_editable(mission_id)?;
+        let current = self.mission_task_ids(mission_id)?;
+        if ordered_ids.len() != current.len() {
+            return Err(StorageError::InvalidMission(
+                "task order must contain every task exactly once",
+            ));
+        }
+        let current_set: HashSet<_> = current.iter().copied().collect();
+        let mut seen = HashSet::new();
+        for id in ordered_ids {
+            if !seen.insert(*id) || !current_set.contains(id) {
+                return Err(StorageError::InvalidMission(
+                    "task order must contain every task exactly once",
+                ));
+            }
+        }
+        let now = unix_time_now() as i64;
+        let transaction = self.connection.unchecked_transaction()?;
+        if !ordered_ids.is_empty() {
+            transaction.execute(
+                "UPDATE mission_tasks SET ordinal = ordinal + 1000000 WHERE mission_id = ?1",
+                [mission_id],
+            )?;
+            for (index, id) in ordered_ids.iter().enumerate() {
+                let ordinal = i64::try_from(index + 1)
+                    .map_err(|_| StorageError::InvalidMission("task order is invalid"))?;
+                transaction.execute(
+                    "UPDATE mission_tasks SET ordinal = ?1 WHERE id = ?2 AND mission_id = ?3",
+                    params![ordinal, id, mission_id],
+                )?;
+            }
+        }
+        transaction.execute(
+            "UPDATE missions SET updated_at = ?1 WHERE id = ?2",
+            params![now, mission_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_mission_task(&self, id: MissionTaskId) -> Result<(), StorageError> {
+        self.require_history_writes()?;
+        let Some((mission_id, status)) = self.task_mission_and_status(id)? else {
+            return Err(StorageError::InvalidMission("task not found"));
+        };
+        self.require_definition_editable(mission_id)?;
+        if status != TaskStatus::Pending {
+            return Err(StorageError::InvalidMission(
+                "task cannot be removed after it leaves pending",
+            ));
+        }
+        if self.task_execution_record_count(id)? > 0 {
+            return Err(StorageError::InvalidMission(
+                "task cannot be removed after execution records exist",
+            ));
+        }
+        let now = unix_time_now() as i64;
+        let transaction = self.connection.unchecked_transaction()?;
+        let updates = {
+            let mut statement = transaction
+                .prepare("SELECT id, depends_on_json FROM mission_tasks WHERE mission_id = ?1")?;
+            let rows = statement.query_map([mission_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut updates = Vec::new();
+            for row in rows {
+                let (task_id, encoded) = row?;
+                if task_id == id {
+                    continue;
+                }
+                let mut dependencies = parse_id_array(&encoded, 1)?;
+                if dependencies.contains(&id) {
+                    dependencies.retain(|dependency| *dependency != id);
+                    updates.push((
+                        task_id,
+                        serde_json::to_string(&dependencies).map_err(StorageError::Json)?,
+                    ));
+                }
+            }
+            updates
+        };
+        for (task_id, dependencies) in updates {
+            transaction.execute(
+                "UPDATE mission_tasks
+                 SET depends_on_json = ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![dependencies, now, task_id],
+            )?;
+        }
+        transaction.execute("DELETE FROM mission_tasks WHERE id = ?1", [id])?;
+        let remaining = {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM mission_tasks WHERE mission_id = ?1 ORDER BY ordinal ASC, id ASC",
+            )?;
+            let rows = statement.query_map([mission_id], |row| row.get::<_, i64>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (index, task_id) in remaining.into_iter().enumerate() {
+            let ordinal = i64::try_from(index + 1)
+                .map_err(|_| StorageError::InvalidMission("task order is invalid"))?;
+            transaction.execute(
+                "UPDATE mission_tasks SET ordinal = ?1 WHERE id = ?2",
+                params![ordinal, task_id],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE missions SET updated_at = ?1 WHERE id = ?2",
+            params![now, mission_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn delete_mission(&self, id: MissionId) -> Result<(), StorageError> {
         self.connection
             .execute("DELETE FROM missions WHERE id = ?1", [id])?;
@@ -989,6 +1354,7 @@ impl Storage {
         .map_err(StorageError::InvalidMission)?;
         validate_optional_text(draft.model, MAX_MODEL_BYTES, "task model is invalid")
             .map_err(StorageError::InvalidMission)?;
+        let depends_on = self.dependencies_json(mission_id, draft.depends_on)?;
         let count: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM mission_tasks WHERE mission_id = ?1",
             [mission_id],
@@ -1003,11 +1369,12 @@ impl Storage {
             |row| row.get(0),
         )?;
         let now = unix_time_now() as i64;
-        self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
             "INSERT INTO mission_tasks
              (mission_id, ordinal, title, objective, status, provider_id, model,
-              created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+              depends_on_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
             params![
                 mission_id,
                 ordinal,
@@ -1016,10 +1383,17 @@ impl Storage {
                 TaskStatus::Pending.as_str(),
                 draft.provider_id.map(|value| value as i64),
                 draft.model.map(str::trim),
+                depends_on,
                 now,
             ],
         )?;
-        let id = self.connection.last_insert_rowid();
+        let id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO task_status_events (task_id, status, note, created_at)
+             VALUES (?1, ?2, NULL, ?3)",
+            params![id, TaskStatus::Pending.as_str(), now],
+        )?;
+        transaction.commit()?;
         self.touch_mission(mission_id)?;
         Ok(id)
     }
@@ -1033,7 +1407,7 @@ impl Storage {
         let mut statement = self.connection.prepare(
             "SELECT id, mission_id, ordinal, title, objective, status,
                     provider_id, model, created_at, updated_at,
-                    started_at, completed_at
+                    started_at, completed_at, depends_on_json
              FROM mission_tasks
              WHERE mission_id = ?1
              ORDER BY ordinal ASC, id ASC
@@ -1056,11 +1430,39 @@ impl Storage {
         let mut statement = self.connection.prepare(
             "SELECT id, mission_id, ordinal, title, objective, status,
                     provider_id, model, created_at, updated_at,
-                    started_at, completed_at
+                    started_at, completed_at, depends_on_json
              FROM mission_tasks WHERE id = ?1",
         )?;
         let task = statement.query_row([id], parse_mission_task).optional()?;
         Ok(task)
+    }
+
+    pub fn list_task_status_history(
+        &self,
+        task_id: MissionTaskId,
+        limit: u32,
+    ) -> Result<Vec<TaskStatusEvent>, StorageError> {
+        let limit = limit.clamp(1, MAX_STATUS_EVENTS);
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_id, status, note, created_at
+             FROM task_status_events WHERE task_id = ?1
+             ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![task_id, limit as i64], |row| {
+            let status: String = row.get(2)?;
+            Ok(TaskStatusEvent {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                status: parse_task_status(&status)?,
+                note: row.get(3)?,
+                created_at: from_i64(row.get(4)?, "created_at")?,
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
     }
 
     pub fn update_mission_task_status(
@@ -1087,7 +1489,9 @@ impl Storage {
                 "task status transition is not allowed",
             ));
         }
-        self.connection.execute(
+        let now = unix_time_now() as i64;
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
             "UPDATE mission_tasks
              SET status = ?1, updated_at = ?2,
                  started_at = CASE
@@ -1098,8 +1502,14 @@ impl Storage {
                           AND completed_at IS NULL THEN ?2
                      ELSE completed_at END
              WHERE id = ?3",
-            params![next.as_str(), unix_time_now() as i64, id],
+            params![next.as_str(), now, id],
         )?;
+        transaction.execute(
+            "INSERT INTO task_status_events (task_id, status, note, created_at)
+             VALUES (?1, ?2, NULL, ?3)",
+            params![id, next.as_str(), now],
+        )?;
+        transaction.commit()?;
         self.touch_mission(mission_id)?;
         Ok(())
     }
@@ -1427,6 +1837,84 @@ impl Storage {
         Ok(from_i64(count, "mission_count")?)
     }
 
+    fn require_definition_editable(&self, id: MissionId) -> Result<(), StorageError> {
+        let current: Option<String> = self
+            .connection
+            .query_row("SELECT status FROM missions WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(current) = current else {
+            return Err(StorageError::InvalidMission("mission not found"));
+        };
+        let status =
+            MissionStatus::parse(&current).ok_or(StorageError::InvalidMission("invalid status"))?;
+        if matches!(status, MissionStatus::Draft | MissionStatus::Planned) {
+            Ok(())
+        } else {
+            Err(StorageError::InvalidMission(
+                "mission definition is locked after planning",
+            ))
+        }
+    }
+
+    fn task_mission_and_status(
+        &self,
+        id: MissionTaskId,
+    ) -> Result<Option<(MissionId, TaskStatus)>, StorageError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT mission_id, status FROM mission_tasks WHERE id = ?1",
+                [id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        row.map(|(mission_id, status)| {
+            let status =
+                TaskStatus::parse(&status).ok_or(StorageError::InvalidMission("invalid status"))?;
+            Ok((mission_id, status))
+        })
+        .transpose()
+    }
+
+    fn task_execution_record_count(&self, id: MissionTaskId) -> Result<i64, StorageError> {
+        Ok(self.connection.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM task_attempts WHERE task_id = ?1)
+              + (SELECT COUNT(*) FROM checkpoints WHERE task_id = ?1)
+              + (SELECT COUNT(*) FROM approvals WHERE task_id = ?1)",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn mission_task_ids(&self, mission_id: MissionId) -> Result<Vec<MissionTaskId>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM mission_tasks WHERE mission_id = ?1 ORDER BY ordinal ASC, id ASC",
+        )?;
+        let rows = statement.query_map([mission_id], |row| row.get::<_, i64>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn dependencies_json(
+        &self,
+        mission_id: MissionId,
+        dependencies: &[MissionTaskId],
+    ) -> Result<String, StorageError> {
+        if dependencies.len() > MAX_DEPENDENCIES {
+            return Err(StorageError::InvalidMission("too many task dependencies"));
+        }
+        let mut seen = HashSet::new();
+        for dependency in dependencies {
+            if !seen.insert(*dependency) {
+                return Err(StorageError::InvalidMission("duplicate task dependency"));
+            }
+            self.require_task_in_mission(*dependency, mission_id)?;
+        }
+        serde_json::to_string(dependencies).map_err(StorageError::Json)
+    }
+
     fn touch_mission(&self, id: MissionId) -> Result<(), StorageError> {
         self.connection.execute(
             "UPDATE missions SET updated_at = ?1 WHERE id = ?2",
@@ -1532,6 +2020,26 @@ fn parse_approval_status(value: &str) -> Result<ApprovalStatus, rusqlite::Error>
         .ok_or_else(|| conversion_error(6, format!("unknown approval status {value}")))
 }
 
+fn parse_string_array(value: &str, column: usize) -> Result<Vec<String>, rusqlite::Error> {
+    serde_json::from_str(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn parse_id_array(value: &str, column: usize) -> Result<Vec<i64>, rusqlite::Error> {
+    serde_json::from_str(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
 fn parse_json_column(value: &str, column: usize) -> Result<serde_json::Value, rusqlite::Error> {
     serde_json::from_str(value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -1560,6 +2068,7 @@ fn parse_mission_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<MissionTask> 
         updated_at: from_i64(row.get(9)?, "updated_at")?,
         started_at: opt_timestamp(row.get(10)?),
         completed_at: opt_timestamp(row.get(11)?),
+        depends_on: parse_id_array(&row.get::<_, String>(12)?, 12)?,
     })
 }
 
@@ -1900,6 +2409,8 @@ mod tests {
             objective: "Ship the next milestone without regressions.",
             constraints,
             workspace: "/tmp/workspace",
+            deliverables: &[],
+            privacy: MissionPrivacy::LocalOnly,
         }
     }
 
@@ -1943,6 +2454,130 @@ mod tests {
     }
 
     #[test]
+    fn deliverables_dependencies_and_task_history_are_persisted() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({"offline": true});
+        let deliverables = vec!["A tested release".to_owned(), "Notes".to_owned()];
+        let mission = storage
+            .create_mission(NewMission {
+                title: "Release",
+                objective: "Ship it.",
+                constraints: &constraints,
+                workspace: "/tmp/work",
+                deliverables: &deliverables,
+                privacy: MissionPrivacy::LocalOnly,
+            })
+            .unwrap();
+        assert_eq!(
+            storage.load_mission(mission).unwrap().unwrap().deliverables,
+            deliverables
+        );
+
+        let first = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "First",
+                    objective: "First step.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[],
+                },
+            )
+            .unwrap();
+        let second = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Second",
+                    objective: "Second step.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[first],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .load_mission_task(second)
+                .unwrap()
+                .unwrap()
+                .depends_on,
+            vec![first]
+        );
+        assert!(matches!(
+            storage.add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Duplicate",
+                    objective: "Bad.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[first, first],
+                },
+            ),
+            Err(StorageError::InvalidMission(_))
+        ));
+
+        storage
+            .update_mission_task_status(second, TaskStatus::Ready)
+            .unwrap();
+        storage
+            .update_mission_task_status(second, TaskStatus::Running)
+            .unwrap();
+        storage
+            .update_mission_task_status(second, TaskStatus::Completed)
+            .unwrap();
+        let history = storage.list_task_status_history(second, 200).unwrap();
+        assert_eq!(
+            history.iter().map(|event| event.status).collect::<Vec<_>>(),
+            vec![
+                TaskStatus::Pending,
+                TaskStatus::Ready,
+                TaskStatus::Running,
+                TaskStatus::Completed
+            ]
+        );
+        assert_eq!(
+            storage.list_task_status_history(second, 2).unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn dependencies_cannot_cross_missions() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({});
+        let first_mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let second_mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let foreign_task = storage
+            .add_mission_task(
+                first_mission,
+                NewMissionTask {
+                    title: "Foreign",
+                    objective: "Other mission.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[],
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            storage.add_mission_task(
+                second_mission,
+                NewMissionTask {
+                    title: "Dependent",
+                    objective: "Bad link.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[foreign_task],
+                },
+            ),
+            Err(StorageError::InvalidMission(_))
+        ));
+    }
+
+    #[test]
     fn mission_tasks_keep_order_and_reject_invalid_status_changes() {
         let storage = Storage::open_in_memory().unwrap();
         let constraints = serde_json::json!({});
@@ -1955,6 +2590,7 @@ mod tests {
                     objective: "Do the first step.",
                     provider_id: Some(3),
                     model: Some("auto"),
+                    depends_on: &[],
                 },
             )
             .unwrap();
@@ -1966,6 +2602,7 @@ mod tests {
                     objective: "Do the second step.",
                     provider_id: None,
                     model: None,
+                    depends_on: &[],
                 },
             )
             .unwrap();
@@ -2010,6 +2647,7 @@ mod tests {
                     objective: "Try once.",
                     provider_id: None,
                     model: None,
+                    depends_on: &[],
                 },
             )
             .unwrap();
@@ -2058,6 +2696,7 @@ mod tests {
                     objective: "Explain the risk.",
                     provider_id: None,
                     model: None,
+                    depends_on: &[],
                 },
             )
             .unwrap();
@@ -2139,6 +2778,7 @@ mod tests {
                     objective: "Do work.",
                     provider_id: None,
                     model: None,
+                    depends_on: &[],
                 },
             )
             .unwrap();
@@ -2207,6 +2847,7 @@ mod tests {
                     objective: "Should not persist.",
                     provider_id: None,
                     model: None,
+                    depends_on: &[],
                 },
             ),
             Err(StorageError::HistoryDisabled)
@@ -2222,9 +2863,519 @@ mod tests {
                     objective: "Persists now.",
                     provider_id: None,
                     model: None,
+                    depends_on: &[],
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn mission_definition_updates_persist_and_lock_after_planning() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({"offline": true});
+        let mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let deliverables = vec!["Notes".to_owned()];
+        let updated = serde_json::json!({"offline": false});
+        storage
+            .update_mission_definition(
+                mission,
+                UpdateMission {
+                    title: "Updated release",
+                    objective: "Updated objective.",
+                    constraints: &updated,
+                    workspace: "/tmp/updated",
+                    deliverables: &deliverables,
+                    privacy: MissionPrivacy::RemoteAllowed,
+                },
+            )
+            .unwrap();
+        let loaded = storage.load_mission(mission).unwrap().unwrap();
+        assert_eq!(loaded.title, "Updated release");
+        assert_eq!(loaded.objective, "Updated objective.");
+        assert_eq!(loaded.workspace, "/tmp/updated");
+        assert_eq!(loaded.deliverables, deliverables);
+        assert_eq!(loaded.privacy, MissionPrivacy::RemoteAllowed);
+        assert_eq!(loaded.constraints, updated);
+
+        storage
+            .update_mission_status(mission, MissionStatus::Planned)
+            .unwrap();
+        storage
+            .update_mission_definition(
+                mission,
+                UpdateMission {
+                    title: "Still editable",
+                    objective: "Planned work is editable.",
+                    constraints: &updated,
+                    workspace: "",
+                    deliverables: &[],
+                    privacy: MissionPrivacy::LocalOnly,
+                },
+            )
+            .unwrap();
+        storage
+            .update_mission_status(mission, MissionStatus::Running)
+            .unwrap();
+        assert!(matches!(
+            storage.update_mission_definition(
+                mission,
+                UpdateMission {
+                    title: "Locked",
+                    objective: "Should fail.",
+                    constraints: &updated,
+                    workspace: "",
+                    deliverables: &[],
+                    privacy: MissionPrivacy::LocalOnly,
+                },
+            ),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert_eq!(
+            storage.load_mission(mission).unwrap().unwrap().title,
+            "Still editable"
+        );
+        assert!(matches!(
+            storage.update_mission_definition(
+                mission,
+                UpdateMission {
+                    title: " ",
+                    objective: "Invalid.",
+                    constraints: &updated,
+                    workspace: "",
+                    deliverables: &[],
+                    privacy: MissionPrivacy::LocalOnly,
+                },
+            ),
+            Err(StorageError::InvalidMission(_))
+        ));
+    }
+
+    #[test]
+    fn task_definition_edits_preserve_execution_history_and_lock_after_start() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({});
+        let mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let task = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Draft",
+                    objective: "Initial objective.",
+                    provider_id: Some(7),
+                    model: Some("auto"),
+                    depends_on: &[],
+                },
+            )
+            .unwrap();
+        storage
+            .update_mission_task_definition(
+                task,
+                UpdateMissionTask {
+                    title: "Edited draft",
+                    objective: "Edited objective.",
+                },
+            )
+            .unwrap();
+        let loaded = storage.load_mission_task(task).unwrap().unwrap();
+        assert_eq!(loaded.title, "Edited draft");
+        assert_eq!(loaded.objective, "Edited objective.");
+        assert_eq!(loaded.status, TaskStatus::Pending);
+        assert_eq!(loaded.provider_id, Some(7));
+        assert_eq!(loaded.model.as_deref(), Some("auto"));
+        assert_eq!(storage.list_task_status_history(task, 10).unwrap().len(), 1);
+
+        storage
+            .update_mission_task_status(task, TaskStatus::Ready)
+            .unwrap();
+        assert!(matches!(
+            storage.update_mission_task_definition(
+                task,
+                UpdateMissionTask {
+                    title: "Too late",
+                    objective: "Should fail.",
+                },
+            ),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert!(matches!(
+            storage.delete_mission_task(task),
+            Err(StorageError::InvalidMission(_))
+        ));
+    }
+
+    #[test]
+    fn task_reordering_requires_the_complete_order_and_rewrites_only_ordinals() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({});
+        let mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let first = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "First",
+                    objective: "One.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[],
+                },
+            )
+            .unwrap();
+        let second = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Second",
+                    objective: "Two.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[],
+                },
+            )
+            .unwrap();
+        let third = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Third",
+                    objective: "Three.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[],
+                },
+            )
+            .unwrap();
+        storage
+            .reorder_mission_tasks(mission, &[third, first, second])
+            .unwrap();
+        let order: Vec<_> = storage
+            .list_mission_tasks(mission, 10)
+            .unwrap()
+            .into_iter()
+            .map(|task| (task.id, task.ordinal))
+            .collect();
+        assert_eq!(order, vec![(third, 1), (first, 2), (second, 3)]);
+        assert_eq!(
+            storage.load_mission_task(third).unwrap().unwrap().status,
+            TaskStatus::Pending
+        );
+        assert!(matches!(
+            storage.reorder_mission_tasks(mission, &[third, first, first]),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert!(matches!(
+            storage.reorder_mission_tasks(mission, &[third, first]),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert_eq!(
+            storage
+                .list_mission_tasks(mission, 10)
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            vec![third, first, second]
+        );
+    }
+
+    #[test]
+    fn deleting_an_unstarted_task_cleans_dependencies_and_compacts_ordinals() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({});
+        let mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let first = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "First",
+                    objective: "One.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[],
+                },
+            )
+            .unwrap();
+        let second = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Second",
+                    objective: "Two.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[first],
+                },
+            )
+            .unwrap();
+        let third = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Third",
+                    objective: "Three.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[second],
+                },
+            )
+            .unwrap();
+        storage.delete_mission_task(first).unwrap();
+        let tasks = storage.list_mission_tasks(mission, 10).unwrap();
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| (task.id, task.ordinal))
+                .collect::<Vec<_>>(),
+            vec![(second, 1), (third, 2)]
+        );
+        assert!(tasks[0].depends_on.is_empty());
+        assert_eq!(tasks[1].depends_on, vec![second]);
+
+        let attempt_task = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Attempted",
+                    objective: "Four.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[],
+                },
+            )
+            .unwrap();
+        storage
+            .update_mission_task_status(attempt_task, TaskStatus::Ready)
+            .unwrap();
+        let attempt = storage.start_task_attempt(attempt_task).unwrap();
+        storage
+            .finish_task_attempt(attempt, AttemptStatus::Succeeded, None)
+            .unwrap();
+        assert!(matches!(
+            storage.delete_mission_task(attempt_task),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert!(storage.load_mission_task(attempt_task).unwrap().is_some());
+    }
+
+    #[test]
+    fn dependencies_reject_invalid_edges_and_preserve_execution_history() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({});
+        let mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let first = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "First",
+                    objective: "One.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[],
+                },
+            )
+            .unwrap();
+        let second = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Second",
+                    objective: "Two.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[first],
+                },
+            )
+            .unwrap();
+        let third = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Third",
+                    objective: "Three.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[second],
+                },
+            )
+            .unwrap();
+        let fourth = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Fourth",
+                    objective: "Four.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[],
+                },
+            )
+            .unwrap();
+        let other_mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let foreign = storage
+            .add_mission_task(
+                other_mission,
+                NewMissionTask {
+                    title: "Foreign",
+                    objective: "Other mission.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[],
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            storage.update_mission_task_dependencies(first, &[first]),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert!(matches!(
+            storage.update_mission_task_dependencies(first, &[third]),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert!(matches!(
+            storage.update_mission_task_dependencies(first, &[foreign]),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert!(matches!(
+            storage.update_mission_task_dependencies(first, &[999_999]),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert!(matches!(
+            storage.update_mission_task_dependencies(first, &[second, second]),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert!(
+            storage
+                .load_mission_task(first)
+                .unwrap()
+                .unwrap()
+                .depends_on
+                .is_empty()
+        );
+
+        storage
+            .update_mission_task_dependencies(fourth, &[first, second])
+            .unwrap();
+        let loaded = storage.load_mission_task(fourth).unwrap().unwrap();
+        assert_eq!(loaded.depends_on, vec![first, second]);
+        assert_eq!(loaded.status, TaskStatus::Pending);
+        assert_eq!(
+            storage.list_task_status_history(fourth, 10).unwrap().len(),
+            1
+        );
+
+        storage
+            .update_mission_task_status(fourth, TaskStatus::Ready)
+            .unwrap();
+        assert!(matches!(
+            storage.update_mission_task_dependencies(fourth, &[first]),
+            Err(StorageError::InvalidMission(_))
+        ));
+        assert_eq!(
+            storage
+                .load_mission_task(fourth)
+                .unwrap()
+                .unwrap()
+                .depends_on,
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn definition_updates_respect_the_history_gate() {
+        let storage = Storage::open_in_memory().unwrap();
+        let constraints = serde_json::json!({});
+        let mission = storage.create_mission(mission_draft(&constraints)).unwrap();
+        let task = storage
+            .add_mission_task(
+                mission,
+                NewMissionTask {
+                    title: "Task",
+                    objective: "Gate check.",
+                    provider_id: None,
+                    model: None,
+                    depends_on: &[],
+                },
+            )
+            .unwrap();
+        storage.set_history_writes(false);
+        assert!(matches!(
+            storage.update_mission_definition(
+                mission,
+                UpdateMission {
+                    title: "Blocked",
+                    objective: "Blocked.",
+                    constraints: &constraints,
+                    workspace: "",
+                    deliverables: &[],
+                    privacy: MissionPrivacy::LocalOnly,
+                },
+            ),
+            Err(StorageError::HistoryDisabled)
+        ));
+        assert!(matches!(
+            storage.update_mission_task_definition(
+                task,
+                UpdateMissionTask {
+                    title: "Blocked",
+                    objective: "Blocked.",
+                },
+            ),
+            Err(StorageError::HistoryDisabled)
+        ));
+        assert!(matches!(
+            storage.reorder_mission_tasks(mission, &[task]),
+            Err(StorageError::HistoryDisabled)
+        ));
+        assert!(matches!(
+            storage.delete_mission_task(task),
+            Err(StorageError::HistoryDisabled)
+        ));
+        assert!(matches!(
+            storage.update_mission_task_dependencies(task, &[]),
+            Err(StorageError::HistoryDisabled)
+        ));
+        storage.set_history_writes(true);
+    }
+
+    #[test]
+    fn version_three_database_adds_privacy_with_a_local_default() {
+        let dir = std::env::temp_dir().join(format!(
+            "nexus-mission-privacy-migration-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nexus.db");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE missions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        title TEXT NOT NULL,
+                        objective TEXT NOT NULL,
+                        constraints_json TEXT NOT NULL DEFAULT '{}',
+                        workspace TEXT NOT NULL DEFAULT '',
+                        deliverables_json TEXT NOT NULL DEFAULT '[]',
+                        status TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        started_at INTEGER,
+                        completed_at INTEGER
+                    );
+                    INSERT INTO missions
+                        (title, objective, status, created_at, updated_at)
+                    VALUES ('Existing', 'Existing mission.', 'draft', 1, 1);
+                    PRAGMA user_version = 3;",
+                )
+                .unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+        let mission = storage.load_mission(1).unwrap().unwrap();
+        assert_eq!(mission.title, "Existing");
+        assert_eq!(mission.privacy, MissionPrivacy::LocalOnly);
+        drop(storage);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2237,6 +3388,8 @@ mod tests {
                 objective: "x",
                 constraints: &array,
                 workspace: "",
+                deliverables: &[],
+                privacy: MissionPrivacy::LocalOnly,
             }),
             Err(StorageError::InvalidMission(_))
         ));
@@ -2246,6 +3399,8 @@ mod tests {
                 objective: "x",
                 constraints: &array,
                 workspace: "",
+                deliverables: &[],
+                privacy: MissionPrivacy::LocalOnly,
             }),
             Err(StorageError::InvalidMission(_))
         ));
@@ -2260,6 +3415,7 @@ mod tests {
                         objective: "Objective",
                         provider_id: None,
                         model: None,
+                        depends_on: &[],
                     },
                 )
                 .unwrap();

@@ -2,7 +2,7 @@
 
 NEXUS is a native Rust desktop workbench for model provider APIs. It connects to OpenAI-compatible Chat Completions endpoints, native Ollama, and the native Anthropic Messages API, keeps conversations in local SQLite, stores provider keys in the macOS Keychain, and shows provider-reported token usage.
 
-MCP server configuration, explicit read-only connections, protocol negotiation, capability display, and tool-metadata discovery are implemented. MCP tool execution, resource reads, prompt retrieval, agent execution, and mission orchestration are **not** implemented. The app sends chat completions over the network only when you press Send.
+MCP server configuration, explicit read-only connections, protocol negotiation, capability display, and tool-metadata discovery are implemented. Mission Control creates and edits mission definitions and lists ordered tasks, attempts, checkpoints, status history, and pending approval records. MCP tool execution, resource reads, prompt retrieval, agent execution, and mission orchestration are **not** implemented. The app sends chat completions over the network only when you press Send.
 
 ## Requirements
 
@@ -72,7 +72,7 @@ No API key is written to the configuration file, the database, or logs.
 - Anthropic, Gemini, and OpenAI Responses tool use are not implemented; chat requests carrying tools or tool results are rejected instead of being silently reshaped. Responses output containing tool calls fails with a clear unsupported-operation error.
 - Gemini safety blocks, recitation stops, OpenAI refusals/content filters, and token-limit truncation are shown as such rather than as ordinary completed answers.
 - Model discovery never installs models, and NEXUS never starts or configures Ollama. Start Ollama and install models yourself.
-- Mission persistence exists as a durable schema and bounded store only. There is no mission composer, mission engine, agent loop, approval execution, or Mission Control UI yet.
+- Mission definitions and tasks can be created, edited, reordered, and removed locally. Task dependencies are editable with cycle, duplicate, missing-reference, and limit checks. Execution history is read-only. There is no decomposition, scheduler, engine, agent loop, status-transition UI, or approval enforcement; pending approvals are informational records only.
 - MCP support is read-only: the official `rmcp` client negotiates the protocol (including the stateless 2026 revision), lists tool metadata, and never calls a tool, reads a resource, retrieves a prompt, samples, or elicits. Nothing connects automatically and no reconnect occurs.
 - MCP servers run only when you press **Connect**. STDIO children receive a minimal environment (`NEXUS_MCP_CLIENT` plus any names you allowlist), never a shell; Streamable HTTP rejects redirects and plain HTTP outside loopback. No MCP credential is stored.
 - Discovery is bounded to 1,000 tools, 10 pages, 256-byte names, 8 KiB descriptions, 256 KiB per schema, with 15-second connect and 20-second discovery timeouts.

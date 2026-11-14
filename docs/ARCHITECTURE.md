@@ -87,13 +87,21 @@ Non-secret endpoint and model settings live in `config.toml`. On macOS, a user-e
 
 `src/mission.rs` defines the durable mission model: missions, ordered tasks, task attempts, checkpoints, and approval requests. Each status has an explicit string encoding and a closed transition table, so persistence rejects illegal jumps such as `completed → running` instead of letting a future engine corrupt history.
 
-SQLite schema version 2 adds `missions`, `mission_tasks`, `task_attempts`, `checkpoints`, and `approvals`. The upgrade is additive: a version-1 database keeps its conversations and receives only the new tables. Foreign keys cascade from a mission to tasks, attempts, checkpoints, and approvals; a deleted task nulls checkpoint/approval task references so the mission-level record survives.
+SQLite schema version 4 adds `missions`, `mission_tasks`, `task_attempts`, `checkpoints`, and `approvals`, then adds mission deliverables, task dependencies, per-task status events, and a typed mission privacy policy. Each upgrade is additive: earlier databases keep existing rows and receive only the new columns and tables. Existing missions default to `local_only` privacy. Foreign keys cascade from a mission to tasks, attempts, checkpoints, and approvals; a deleted task nulls checkpoint/approval task references so the mission-level record survives.
+
+Deliverables and dependencies are validated before use. Dependencies must name tasks in the same mission, cannot repeat, cannot reference the task itself, and are limited to 100 per task. A shared graph check rejects direct and indirect cycles before either the UI or storage writes them. Every task receives an initial `pending` status event, and later status changes append an event so history cannot be silently rewritten. Status history reads are clamped to 200 events.
 
 All mission writes pass through the history-write gate. With history disabled, creating or mutating missions fails while reads and deletion remain available, matching the conversation boundary. Clearing history deletes missions as well as conversations.
 
 Inputs are bounded before storage: 200-byte titles, 16 KiB objectives, 4 KiB workspaces, 65 KiB JSON objects, 1,000 tasks per mission, 200 attempts per task, 500 checkpoints and 500 approvals per mission. Read APIs clamp to 200 missions, 1,000 tasks, and 200 attempts/checkpoints/approvals. Task attempts and approval decisions are append-only in practice: a finished attempt cannot be finished again, and a decided approval cannot be re-decided.
 
-This layer performs no decomposition, scheduling, scoring, provider calls, tool calls, or approvals. Approvals are records only; no code consumes an approved record to grant execution.
+`src/ui/missions.rs` provides Mission Control. It creates and edits mission definitions (title, objective, workspace, privacy, JSON constraints, and deliverables) and task definitions, edits dependencies, reorders tasks, and removes unstarted tasks. Definition fields are validated before saving and again at the storage boundary. Task removal is transactional: dependencies on the removed task are stripped and remaining ordinals are compacted.
+
+Definition editing is deliberately separate from execution history. Mission definitions are editable only in `draft` or `planned`; task definitions are editable only while the task is `pending` and has no attempts, checkpoints, or approvals. Update methods never touch task status, timestamps, attempts, checkpoints, approvals, or status events. Mission deletion is the only operation that deliberately removes execution history, and the UI requires confirmation.
+
+The UI shows a bounded mission overview with creation/update information, mission detail with constraints, deliverables, ordered tasks, dependencies, privacy, task detail with attempts, checkpoints, and status history, plus a separate pending approval queue labelled informational. Selection loads on click or explicit refresh; no database read occurs per frame, and all lists state when they are truncated. Empty, deleted-mission, and load-error states are explicit, and the last successful data stays visible after a read failure.
+
+This layer performs no decomposition, scheduling, scoring, provider calls, tool calls, status transitions, or approvals. Approvals are records only; the Mission Control UI has no approve or deny control, and no code consumes an approved record to grant execution.
 
 ## MCP read-only client foundation
 

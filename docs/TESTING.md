@@ -100,15 +100,28 @@ never installs or downloads anything.
 `src/mission.rs` tests the status transition tables, terminal-state closure, and input validation. `src/storage.rs` adds tests for:
 
 - mission create/load/list and status transitions, including rejected illegal jumps
-- ordered tasks, bounded task lists, and task timestamps
+- ordered tasks, bounded task lists, task timestamps, deliverables, and dependencies
+- cross-mission dependency rejection and duplicate dependency rejection
+- appended task status history, including the initial pending event and read clamping
 - attempt numbering, terminal-only completion, and double-finish rejection
 - checkpoint and approval ownership, pending counts, and one-time decisions
 - cascade deletion plus `clear_all_history`
 - history-gate blocking of mission writes with reads still available
 - input validation and list clamping
-- upgrading a version-1 database to schema version 2 without recreating conversations
+- upgrading a version-1 database to schema version 4 without recreating conversations
+- adding privacy to a version-3 database with a `local_only` default
+- mission and task definition updates, including rejected edits after planning
+- task edits preserving status, assignment, and status history
+- full-order task reordering and incomplete/duplicate order rejection
+- deleting an unstarted task with dependency cleanup and ordinal compaction
+- refusing task deletion after an attempt exists
+- dependency edits rejecting self, duplicate, missing, cross-mission, and direct/indirect cycle edges
+- failed dependency edits leaving the prior list and status history unchanged
+- history-gate rejection for every definition mutation
 
-These tests use an in-memory database except for the migration test, which uses an isolated temporary directory. No mission execution, provider call, MCP connection, or network access is involved.
+These tests use an in-memory database except for the migration tests, which use isolated temporary directories. No mission execution, provider call, MCP connection, or network access is involved.
+
+`src/ui/tests.rs` drives the headless Missions screen through AccessKit. It covers the empty mission and approval states, mission and task selection with keyboard activation, attempts/checkpoints/status history, the informational approval queue, deleted-mission recovery, bounded mission lists, and forced load errors that keep the last successful data. It also creates and edits a mission, changes privacy, rejects invalid JSON before saving, adds/edits/reorders/removes tasks, edits dependencies, rejects a dependency cycle before saving, and confirms mission deletion. Snapshot baselines are `missions-empty.png`, `missions-overview.png`, `mission-editor.png`, `task-editor.png`, `dependency-editor.png`, and `approval-queue.png`. The mission fixture pins display timestamps only in test builds so snapshots stay deterministic.
 
 ## MCP tests
 

@@ -699,12 +699,19 @@ fn main() {
             let source_path = dir.join("mock.rs");
             let binary_path = dir.join("mock-server");
             std::fs::write(&source_path, source).unwrap();
-            let deps = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join("debug")
-                .join("deps");
+            let executable = std::env::current_exe()
+                .expect("the test executable path must be available for the MCP fixture");
+            let deps = executable
+                .parent()
+                .expect("the test executable must have a parent directory")
+                .to_path_buf();
             let serde_json = std::fs::read_dir(&deps)
-                .unwrap()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "cannot read Cargo dependency directory {}: {error}",
+                        deps.display()
+                    )
+                })
                 .filter_map(Result::ok)
                 .map(|entry| entry.path())
                 .filter(|path| {
@@ -715,7 +722,12 @@ fn main() {
                         })
                 })
                 .max_by_key(|path| path.metadata().and_then(|meta| meta.modified()).ok())
-                .expect("serde_json rlib must exist for the fixture");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "serde_json rlib must exist in Cargo dependency directory {}",
+                        deps.display()
+                    )
+                });
             let status = std::process::Command::new("rustc")
                 .arg("--edition=2021")
                 .arg("-L")
