@@ -21,6 +21,8 @@
 
 ## Phase 2 — discovery and registry
 
+**Current checkout:** not present. The registry and discovery implementation must be restored or implemented before agent routing; provider profiles are not an agent registry.
+
 - Maintain a documented bounded catalog of verified agent harness/CLI identities, including Codex CLI, Claude Code, OpenCode, Pi, Gemini CLI, GitHub Copilot CLI, Aider, Amp, and Goose.
 - Standard Discovery checks exact executable names in eligible PATH roots plus documented Homebrew/npm/Cargo/Bun/Volta/pnpm and other common user-level binary locations only on explicit request.
 - Offer a separate, explicitly approved Expanded scope over named local software-install roots, with traversal/time/entry limits, exclusions, progress, and cancellation.
@@ -36,6 +38,8 @@
 **Exit criteria:** registry claims distinguish observations, vendor documentation, user-reported information, and unknown values; detected candidates are not represented as integrated or usable; no agent is executed or contacted.
 
 ## Phase 3 — intelligent agent routing
+
+**Current checkout:** not present. There is no routing module, capability catalog, `AgentRecord`, or agent registry. This phase is a prerequisite for real agent/model selection in Phase 5.
 
 - Represent bounded, session-only tasks with user-confirmed categories, mandatory requirements, and optional preferences.
 - Maintain a typed, curated capability catalog with provenance and freshness evidence, separate from executable discovery.
@@ -87,6 +91,14 @@
 - Definition edits are locked after planning; execution history is never rewritten by an edit.
 - Mission overview, mission detail, task detail, and an informational approval queue with empty, deleted, error, and truncation states.
 - No decomposition, scheduling, status-transition UI, provider/tool execution, or approval enforcement. These remain next.
+
+### Planning-domain foundation (Phase 5D.1, implemented)
+
+- Typed planning inputs for mission/task snapshots, budgets, requirements, preferences, and a caller-supplied inventory.
+- Explicit sparse agent-model compatibility links with per-record claims and provenance; missing links remain unknown.
+- Bounded agents, models, capabilities, evidence, localities, requirements, and preferences.
+- Deterministic normalization and pure validation errors; no clock, I/O, network, credentials, storage, registry, scoring, selection, approvals, or persistence.
+- No agent or model recommendation is claimed until the Phase 2 registry and Phase 3 router exist.
 
 - Task schema: objective, constraints, workspace, budget, privacy, deliverables.
 - Manual Master Agent selection and automatic selection.

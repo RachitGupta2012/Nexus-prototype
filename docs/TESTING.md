@@ -121,6 +121,28 @@ never installs or downloads anything.
 
 These tests use an in-memory database except for the migration tests, which use isolated temporary directories. No mission execution, provider call, MCP connection, or network access is involved.
 
+## Planning-domain tests
+
+`src/mission/planning.rs` tests the Phase 5D.1 validation boundary without storage, UI, network, credentials, or a clock. The module currently contains 27 tests; the workspace suite contains 282 tests, with 281 passing and one ignored live-Ollama test as of this remediation. Coverage includes:
+
+- draft/planned mission and pending-task requirements
+- positive mission/task IDs, unique task IDs, contiguous ordinals, and mission ownership
+- self, duplicate, missing, cyclic, exact-100, and over-100 dependency validation through `validate_planning_request`
+- global, task-specific, duplicate, conflicting, missing-task, and pre-deduplication requirement bounds
+- exact and overflow boundaries for tasks, agents, models, links, capabilities, evidence, locality, requirement groups, global requirements, preferences, identifiers, labels, versions, and currencies
+- exact 1,000-task acceptance and 1,001-task rejection; exact 8/9 compatibility-evidence and 2/3 model-locality boundaries
+- unique capabilities per agent with multiple evidence records retained
+- sparse agent-model links; missing links stay unknown and provider data creates no links
+- independent preservation of compatibility, capability, and locality claims, quality, source, timestamp, and version provenance
+- absent, input-only, output-only, and both-present prices; missing, empty, and oversized currencies; no cost calculation
+- oversized nested mission JSON rejected through the bounded serializer, with valid nested JSON preserved
+- `None`, `Some(0)`, and positive budget limits kept distinct
+- deterministic normalized output from equivalent shuffled agents, models, links, requirements, and preferences
+- empty inventories remaining valid
+- a source-level guard against clock, filesystem, network, process, environment, database, credential, Keychain, and HTTP access
+
+No planning test evaluates compatibility, ranks candidates, selects an agent/model, creates a plan or approval, or persists data.
+
 `src/ui/tests.rs` drives the headless Missions screen through AccessKit. It covers the empty mission and approval states, mission and task selection with keyboard activation, attempts/checkpoints/status history, the informational approval queue, deleted-mission recovery, bounded mission lists, and forced load errors that keep the last successful data. It also creates and edits a mission, changes privacy, rejects invalid JSON before saving, adds/edits/reorders/removes tasks, edits dependencies, rejects a dependency cycle before saving, and confirms mission deletion. Snapshot baselines are `missions-empty.png`, `missions-overview.png`, `mission-editor.png`, `task-editor.png`, `dependency-editor.png`, and `approval-queue.png`. The mission fixture pins display timestamps only in test builds so snapshots stay deterministic.
 
 ## MCP tests

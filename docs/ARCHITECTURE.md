@@ -56,7 +56,9 @@ The initial Resource Monitor samples only NEXUS's own PID through a process-spec
 
 ## Phase 2 discovery and registry
 
-Discovery is an explicit user action. Standard Discovery uses a short-lived standard-library worker to check exact candidate names in at most 64 eligible PATH roots (16 KiB input), conventional macOS package-manager/user binary roots, and optional user-approved direct custom directories. The full roots and skip reasons are displayed. Expanded Discovery requires explicit scope consent and walks only `/Applications`, `/opt`, and the current user's `~/Applications` to depth 4, at most 128 directories/3,000 entries, or 10 seconds. It skips symlinked directories and protected/personal-data subtrees. Both modes are cancelable; cancellation is checked between filesystem operations. Custom folders use a native macOS folder picker and are rejected when path components are symlinks or the filesystem is remote/unrecognized. Safe platform filesystem metadata comes through the small `nix` wrapper; folder picking uses macOS AppKit through `rfd`. No shell, package manager, candidate, process list, credentials, configuration, or network is accessed.
+**Status in this checkout:** the agent-discovery and registry implementation described below is not present in the source tree. Provider profiles are not a substitute for that registry. The following is the required Phase 2 contract and remains a prerequisite for real agent routing.
+
+The required implementation would make discovery an explicit user action. Standard Discovery would use a short-lived standard-library worker to check exact candidate names in at most 64 eligible PATH roots (16 KiB input), conventional macOS package-manager/user binary roots, and optional user-approved direct custom directories. The full roots and skip reasons are displayed. Expanded Discovery requires explicit scope consent and walks only `/Applications`, `/opt`, and the current user's `~/Applications` to depth 4, at most 128 directories/3,000 entries, or 10 seconds. It skips symlinked directories and protected/personal-data subtrees. Both modes are cancelable; cancellation is checked between filesystem operations. Custom folders use a native macOS folder picker and are rejected when path components are symlinks or the filesystem is remote/unrecognized. Safe platform filesystem metadata comes through the small `nix` wrapper; folder picking uses macOS AppKit through `rfd`. No shell, package manager, candidate, process list, credentials, configuration, or network is accessed.
 
 `DiscoveryScope` remains separate from `IntegrationStatus`. Scope consent authorizes only passive local detection. The approval version is persisted so any material catalog/scope change can require renewed consent. Custom paths are stored only in NEXUS's registry and authorize exact nonrecursive checks directly in the selected directory. Registry search-result details are bounded and disclose when the presentation limit is reached.
 
@@ -65,6 +67,8 @@ The registry stores NEXUS-owned metadata in `registry.toml` beside the applicati
 Candidate detection, version, running state, authentication, connectability, and usability remain distinct. Vendor documentation is recorded as documentation evidence, not proof about the detected installation. Version verification is a separate user-run operation; NEXUS does not execute version commands during discovery. No adapter is implemented in Phase 2.
 
 ## Phase 3 task routing
+
+**Status in this checkout:** the routing and agent-registry implementation described below is not present. There is no `task.rs`, `capability.rs`, `routing.rs`, `AgentRecord`, or agent registry. The provider configuration in `config.toml` is not an agent inventory and cannot stand in for one. The following is the required Phase 3 contract; it must be restored or implemented before NEXUS can make real agent or model recommendations.
 
 Routing is a synchronous, pure evaluation over a validated in-memory `Task`, a read-only snapshot of `AgentRecord`s, a curated Rust capability catalog, and an explicit evaluation timestamp. `task.rs` owns bounded task input and manual categories; `capability.rs` owns stable capability identifiers and provenance-bearing evidence; `routing.rs` compares the inputs and returns explanations and outcomes. It has no filesystem, process, network, credential, or registry-write access. The UI retains task text and a manual selection only in the current session.
 
@@ -78,7 +82,7 @@ Application bundles have a separate typed detection record rather than being rep
 
 ## Explicit provider connection
 
-`provider.rs` implements a narrow direct provider client for OpenAI-compatible Chat Completions. It is separate from the pure `routing.rs` recommendation engine and from the discovered agent registry. A compatible local gateway (including a FreeLLMAPI-style gateway) can provide model selection/routing by using its documented base URL and model selector; NEXUS does not claim to support every vendor API protocol.
+`provider.rs` implements a narrow direct provider client for OpenAI-compatible Chat Completions. It is separate from the future pure `routing.rs` recommendation engine and from the future discovered agent registry. A compatible local gateway (including a FreeLLMAPI-style gateway) can provide model selection/routing by using its documented base URL and model selector; NEXUS does not claim to support every vendor API protocol.
 
 Non-secret endpoint and model settings live in `config.toml`. On macOS, a user-entered provider key is stored through the OS Keychain and is not serialized or logged. Keychain reads happen only on the worker spawned by an explicit **Send task to provider** action. That operation sends the user's task description to the configured endpoint and displays a text response. It never launches a discovered agent, changes files, or authorizes execution. Requests use HTTPS for remote endpoints, allow plain HTTP only for loopback, do not follow redirects, have a total timeout, and cap the response body. The UI thread remains responsive while the bounded request is in flight.
 
@@ -102,6 +106,18 @@ Definition editing is deliberately separate from execution history. Mission defi
 The UI shows a bounded mission overview with creation/update information, mission detail with constraints, deliverables, ordered tasks, dependencies, privacy, task detail with attempts, checkpoints, and status history, plus a separate pending approval queue labelled informational. Selection loads on click or explicit refresh; no database read occurs per frame, and all lists state when they are truncated. Empty, deleted-mission, and load-error states are explicit, and the last successful data stays visible after a read failure.
 
 This layer performs no decomposition, scheduling, scoring, provider calls, tool calls, status transitions, or approvals. Approvals are records only; the Mission Control UI has no approve or deny control, and no code consumes an approved record to grant execution.
+
+### Planning-domain foundation (implemented)
+
+`src/mission/planning.rs` defines the Phase 5D.1 planning input boundary. It is a pure, local validation layer: it accepts a draft or planned mission, its pending task definitions, typed budget/requirements/preferences, and a caller-supplied inventory of agents, models, and sparse agent-model compatibility links.
+
+Each compatibility and capability record keeps its own evidence claim (`supported`, `unsupported`, or `unknown`) and provenance. Locality records separately keep `local`, `remote`, or `unknown`. Missing links mean unknown compatibility. The planner does not aggregate conflicts, calculate freshness, filter, rank, select, estimate costs, create approvals, or persist a plan. It reads no clock, filesystem, network, credentials, database, or registry.
+
+The inventory is not derived from provider profiles. An empty inventory is valid. No real agent or model recommendation is possible until the Phase 2 registry and Phase 3 evidence-producing router exist.
+
+Validation requires positive mission and task IDs and is bounded to 64 agents, 2,000 models, 4,096 explicit links, 32 capabilities per agent, eight evidence records per capability or link, two locality records per candidate, 1,000 tasks, 12 global requirements, 128 submitted requirement entries before deduplication, 128 task requirement groups, 12 entries per preference class, 24 total preferences, and 100 dependencies per task. Task dependencies reuse the shared mission validators, and dependency lists are validated before any owned edge list is built. Oversized mission JSON constraints are rejected through bounded serialization.
+
+A model candidate has one currency field shared by its input and output prices. Phase 5D.1 therefore cannot represent two independently priced currencies on one model; no currency conversion or cost calculation is performed. Normalization is deterministic: agents, models, links, capabilities, evidence, requirements, and preferences are sorted by stable keys without discarding conflicting evidence, and equivalent shuffled inputs produce the same normalized output.
 
 ## MCP read-only client foundation
 

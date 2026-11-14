@@ -5,6 +5,8 @@
 //! requests. Nothing in this module decomposes, schedules, executes, or
 //! approves work; the mission engine will consume this store later.
 
+pub mod planning;
+
 use serde_json::Value;
 
 pub type MissionId = i64;
@@ -508,16 +510,48 @@ pub fn deliverable_list(items: &[String], message: &'static str) -> Result<Strin
     Ok(encoded)
 }
 
-/// Serializes a JSON object after checking its encoded size.
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl std::io::Write for BoundedJsonWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let Some(next_len) = self.bytes.len().checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(std::io::Error::other("JSON byte limit exceeded"));
+        };
+        if next_len > MAX_JSON_BYTES {
+            self.exceeded = true;
+            return Err(std::io::Error::other("JSON byte limit exceeded"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serializes a JSON object while enforcing the encoded byte limit. The
+/// serializer writes into a bounded buffer, so oversized values are rejected
+/// without first allocating their full encoded representation.
 pub fn json_object(value: &Value, message: &'static str) -> Result<String, &'static str> {
     if !value.is_object() {
         return Err(message);
     }
-    let encoded = serde_json::to_string(value).map_err(|_| message)?;
-    if encoded.len() > MAX_JSON_BYTES {
+    let mut writer = BoundedJsonWriter {
+        bytes: Vec::new(),
+        exceeded: false,
+    };
+    if serde_json::to_writer(&mut writer, value).is_err()
+        || writer.exceeded
+        || writer.bytes.len() > MAX_JSON_BYTES
+    {
         return Err(message);
     }
-    Ok(encoded)
+    String::from_utf8(writer.bytes).map_err(|_| message)
 }
 
 /// Validates a proposed dependency list against the tasks in one mission.
